@@ -3,7 +3,7 @@ import math
 import numpy as np
 from typing import List
 
-ti.init(arch=ti.cuda, debug=False)
+ti.init(arch=ti.cpu, debug=False)
 
 
 @ti.dataclass
@@ -17,7 +17,9 @@ class Cell():
     cell_id: int
     cell_type: int
     preferred_volume: float
+    preferred_perimeter: float
     current_volume: float
+    current_perimeter: float
     center: ti.math.vec2
     should_split: int
 
@@ -25,7 +27,8 @@ class Cell():
 class CellPoint():
     cell_id: int
     cell_type: int
-    is_membrane: int
+    is_membrane: int # 1 if it is a membrane (has neighbors with different cell_id)
+    local_perimeter: int # number of neighbors with different cell_id
     selected_as_src: int
     selected_as_trg: int
     copy_into: ti.math.vec2
@@ -41,6 +44,7 @@ class Simulation():
         self.max_cells=sim_config["max_cells"]
         self.max_cell_types = sim_config["max_cell_types"]
         self.lambda_volume = sim_config["lambda_volume"]
+        self.lambda_perimeter = sim_config["lambda_perimeter"]
         self.gui = ti.GUI(name="MycroVerse", res=self.size)
         self.render_grid = ti.field(dtype=float, shape=(self.size, self.size, 3))
         self.select_prob = .5
@@ -126,15 +130,19 @@ class Simulation():
         return ti.cast(i< 0 or i >= self.size or j<0 or j>=self.size, int)
 
     @ti.func
-    def is_membrane(self, i, j):
-        membrane = 0 
+    def local_perimeter(self, i, j, grid_value) -> int:
+        """
+            Returns the local perimeter of a pixel in the grid assuming the given grid_value as cell_id.
+            (This allows to calculate the perimeter of a pixel assuming it is part of a different cell)
+        """
+        local_perimeter = 0 
         for i_offset in range(-1, 2):
             for j_offset in range(-1, 2):
-                if self.grid[i, j].cell_id > 0 and \
-                not self.is_out_of_bounds(i+i_offset, j+j_offset) and \
-                self.grid[i, j].cell_id != self.grid[i+i_offset, j+j_offset].cell_id:
-                    membrane = 1
-        return membrane
+                if grid_value > 0 and \
+                   not self.is_out_of_bounds(i+i_offset, j+j_offset) and \
+                   grid_value != self.grid[i+i_offset, j+j_offset].cell_id:
+                   ti.atomic_add(local_perimeter, 1)
+        return local_perimeter
 
     @ti.func
     def pick_random_neighbor(self, i, j) -> ti.Vector:
@@ -152,26 +160,25 @@ class Simulation():
         return neigh
 
     @ti.kernel
-    def find_membranes(self):
-        for i, j in self.grid:
-            self.grid[i, j].is_membrane = self.is_membrane(i, j)
-
-    @ti.kernel
     def reset_grid_params(self):
         for c in self.cells:
             if self.cells[c].cell_type > 0:
+                self.cells[c].current_perimeter = 0.0
                 self.cells[c].current_volume = 0.0
                 self.cells[c].center = ti.Vector([0.0, 0.0])
                 self.cells[c].should_split = 0
+                
             
         for i, j in self.grid:
-            self.grid[i, j].is_membrane = self.is_membrane(i, j)
+            self.grid[i, j].local_perimeter = self.local_perimeter(i, j, self.grid[i, j].cell_id)
+            self.grid[i, j].is_membrane = int(self.grid[i, j].local_perimeter > 0)  
             self.grid[i, j].selected_as_src = 0
             self.grid[i, j].selected_as_trg = 0
             self.grid[i, j].copy_into.fill(0)
             self.grid[i, j].copy_from.fill(0)
             if self.grid[i, j].cell_id > 0:
                 ti.atomic_add(self.cells[self.grid[i, j].cell_id].current_volume, 1.0)
+                ti.atomic_add(self.cells[self.grid[i, j].cell_id].current_perimeter, self.grid[i, j].local_perimeter)
                 # Use center as accumulator temporarily
                 ti.atomic_add(self.cells[self.grid[i, j].cell_id].center.x, float(i))
                 ti.atomic_add(self.cells[self.grid[i, j].cell_id].center.y, float(j))
@@ -182,6 +189,9 @@ class Simulation():
             if self.cells[c].current_volume > 0:
                 self.cells[c].center /= self.cells[c].current_volume
                 #print(f"Cell {c} Center: {self.cells[c].center[0]} {self.cells[c].center[1]}")
+                # Recompute preferred perimeter to keep roundness based on current volume
+                self.cells[c].preferred_perimeter = 2 * math.pi * ti.sqrt(self.cells[c].preferred_volume / math.pi)
+                
 
     @ti.kernel
     def do_copy(self):
@@ -275,7 +285,7 @@ class Simulation():
     def calc_volume_h(self, src_cell_id: int, tgt_cell_id: int) -> float:
         total_energy = 0.0
         # Taichi does not support nested for...
-        for c in range(self.max_cells):
+        for c in range(self.n_cells[None]):
             gain = 0.0
             if src_cell_id == c:
                 # Current Volume gain one pixel
@@ -285,7 +295,37 @@ class Simulation():
                 gain -= 1.0
             total_energy += self.lambda_volume * (self.cells[c].current_volume + gain - self.cells[c].preferred_volume)**2
         return total_energy
-    
+
+    @ti.func
+    def calc_perimeter_h(self, s_i:int, s_j:int, t_i:int, t_j:int, t_value:int) -> float:
+        """
+            Calculate the perimeter energy of a pixel assuming it is copied from s to t.
+            To calculate the current perimeter, pass the same i,j as s_i, s_j and t_i, t_j
+        """
+        total_energy = 0.0
+
+        for c in range(self.n_cells[None]):
+            # All cells that are not source or target will keep the same perimeter so they are not considered
+            
+            if c > 0 and (c == t_value or c == self.grid[s_i, s_j].cell_id):
+                gain_perimeter = 0.0
+                current_perimeter = self.cells[c].current_perimeter
+
+                # If the source and target are the same, we have no gain, otherwise...
+                if s_i != t_i or s_j != t_j:
+                    # We just consider the neighborhood of the target pixel (which is the only one that changes)
+                    same_cell_neighbors = 8 - self.local_perimeter(t_i, t_j, c)
+                    if c == t_value:
+                        gain_perimeter = -8 + 2*same_cell_neighbors
+                    else:
+                        gain_perimeter = 8 - 2*same_cell_neighbors
+            
+                ti.atomic_add(total_energy, self.lambda_perimeter * (current_perimeter + gain_perimeter - self.cells[c].current_volume)**2)
+
+        return total_energy
+
+        
+
     @ti.kernel
     def calc_energy(self):
         for i, j in self.grid:
@@ -301,27 +341,28 @@ class Simulation():
 
                # Volume: Hvol after copy - Current Hvol (0 gain given by src==target)
                delta_volume = self.calc_volume_h(src_cell_id=self.grid[i, j].cell_id, tgt_cell_id=self.grid[t_i, t_j].cell_id) - self.calc_volume_h(src_cell_id=self.grid[i, j].cell_id, tgt_cell_id=self.grid[i, j].cell_id)
-                             
                ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_volume)
+
+               # Perimeter:
+               # delta_perimter = H_per after copy - Current H_per
+               delta_perimeter = self.calc_perimeter_h(i, j, t_i, t_j, self.grid[t_i, t_j].cell_id) - self.calc_perimeter_h(i, j, i, j, self.grid[i, j].cell_id)
+               ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_perimeter)
 
 
     def cpm_step(self):
-        # Membranes are stored in .is_membrane
-        self.find_membranes()
         # Sources and targets are stored into .selected* and .copy_*
         self.select_potential_copies()
         # Avoiding race conditions (where multiple pixels wants to source/target the same pixels)
         self.calc_energy()
         self.do_copy()
 
-        # Update parameters from grid:
+        # Update cell grid parameters from grid:
         self.reset_grid_params()
-
+    
     @ti.kernel
     def check_mitosis(self):
         for c in self.cells:
             if self.cells[c].current_volume > self.cells[c].preferred_volume:
-                print(f"{c} ready for mitosis ({self.cells[c].current_volume} > {self.cells[c].preferred_volume})")
                 self.cells[c].should_split = 1
 
     def biology_events(self):
@@ -338,8 +379,8 @@ class Simulation():
     def render(self):
         for i, j in self.grid:
             self.render_grid[i, j, 0] = self.grid[i, j].cell_id / self.n_cells[None]
-            self.render_grid[i, j, 1] = self.grid[i, j].copy_into[0] / self.size
-            self.render_grid[i, j, 2] = self.grid[i, j].copy_into[1] / self.size
+            self.render_grid[i, j, 1] = self.grid[i, j].local_perimeter / 8
+            self.render_grid[i, j, 2] = 0.0
 
     def draw(self):
         self.gui.clear()
@@ -361,15 +402,15 @@ class Simulation():
 
 
 sim_config = {
-    "size": 1024,
+    "size": 512,
     "max_cell_types": 10,
     "max_cells": 1000,
     "lambda_volume": 1,
-    "lambda_perimeter": 10,
+    "lambda_perimeter": 0.5,
     "cell_types": [
         {
-            "j_adhesion_stroma": 0.1,
-            "j_adhesion_other": 0.1,
+            "j_adhesion_stroma": 0.01*8,
+            "j_adhesion_other": .1*8,
             "preferred_volume_stats": [0.005, 0.001],
          }
     ]
