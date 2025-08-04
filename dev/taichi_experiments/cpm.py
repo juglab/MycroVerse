@@ -11,6 +11,8 @@ class CellType():
     j_adhesion_stroma: float
     j_adhesion_other: float
     preferred_volume_stats: ti.math.vec2 # mean and std for preferred volume
+    preferred_polarization_stats : ti.math.vec2 # mean and std for preferred polarization vector
+    preferred_polarization_strength_stats: ti.math.vec2 # mean and std for preferred polarization strength
     
 @ti.dataclass
 class Cell():
@@ -18,6 +20,8 @@ class Cell():
     cell_type: int
     preferred_volume: float
     preferred_perimeter: float
+    preferred_polarization: ti.math.vec2 # Preferred polarization vector for the cell
+    polarization_strength: float # Strength of the polarization
     current_volume: float
     current_perimeter: float
     center: ti.math.vec2
@@ -44,8 +48,10 @@ class Simulation():
         self.size = sim_config["size"]
         self.max_cells=sim_config["max_cells"]
         self.max_cell_types = sim_config["max_cell_types"]
+        self.temperature = sim_config["temperature"]
         self.lambda_volume = sim_config["lambda_volume"]
         self.lambda_perimeter = sim_config["lambda_perimeter"]
+        self.lambda_polarization = sim_config["lambda_polarization"]
         self.gui = ti.GUI(name="MycroVerse", res=self.size)
         self.render_grid = ti.field(dtype=float, shape=(self.size, self.size, 3))
         self.select_prob = .5
@@ -60,6 +66,8 @@ class Simulation():
             self.cell_types[c+1].j_adhesion_stroma = ct["j_adhesion_stroma"]
             self.cell_types[c+1].j_adhesion_other = ct["j_adhesion_other"]
             self.cell_types[c+1].preferred_volume_stats = ti.Vector(arr=ct["preferred_volume_stats"])
+            self.cell_types[c+1].preferred_polarization_stats = ti.Vector(arr=ct.get("preferred_polarization_stats", [0.0, 0.0]))
+            self.cell_types[c+1].preferred_polarization_strength_stats = ti.Vector(arr=ct.get("preferred_polarization_strength_stats", [0.0, 0.0]))
 
     def reinit(self):
         self.grid = CellPoint.field(shape=(self.size, self.size))
@@ -118,7 +126,11 @@ class Simulation():
         self.n_cells[None] += 1
         self.cells[cell_id].cell_type = cell_type
         self.cells[cell_id].preferred_volume = np.clip(np.random.normal(loc=mu_vol, scale=std_vol), .0001, 1) * self.size * self.size
-
+        self.cells[cell_id].preferred_polarization = ti.Vector(np.random.normal(loc=self.cell_types[cell_type].preferred_polarization_stats[0],
+                                                                                 scale=self.cell_types[cell_type].preferred_polarization_stats[1], size=2))
+        print(f"Cell {cell_id} Type {cell_type} Preferred Volume: {self.cells[cell_id].preferred_volume}, Polarization: {self.cells[cell_id].preferred_polarization}")
+        self.cells[cell_id].polarization_strength = np.clip(np.random.normal(loc=self.cell_types[cell_type].preferred_polarization_strength_stats[0],
+                                                                                  scale=self.cell_types[cell_type].preferred_polarization_strength_stats[1]), 0.0, 1.0)
         radius = 0.02
         n_edges = 16
         verts = ti.Vector.field(n=2, dtype=int, shape=(n_edges,))
@@ -221,12 +233,24 @@ class Simulation():
         for i, j in self.grid:
             if self.grid[i, j].selected_as_src:
                 t_i, t_j = ti.cast(self.grid[i, j].copy_into[0], int), ti.cast(self.grid[i, j].copy_into[1], int)
-                if self.grid[i, j].copy_energy_delta < 0:
+                delta_E = self.grid[i, j].copy_energy_delta
+                accept = False
+
+                if delta_E <= 0:
+                    accept = True
+                else:
+                    prob = ti.exp(-delta_E / self.temperature)
+                    if ti.random() < prob:
+                        accept = True
+
+                if accept:
                     self.grid[t_i, t_j].cell_type = self.grid[i, j].cell_type
                     self.grid[t_i, t_j].cell_id = self.grid[i, j].cell_id
-                    self.grid[t_i, t_j].selected_as_src = 0
-                    self.grid[t_i, t_j].selected_as_trg = 0
-                    self.grid[t_i, t_j].copy_energy_delta = 0
+
+                # Always reset regardless of acceptance
+                self.grid[t_i, j].selected_as_src = 0
+                self.grid[t_i, j].selected_as_trg = 0
+                self.grid[t_i, j].copy_energy_delta = 0
 
     @ti.kernel
     def trigger_mitosis(self):
@@ -247,14 +271,18 @@ class Simulation():
                             if self.grid[i, j].cell_id == cell_id:
                                 pos = ti.Vector([float(i), float(j)])
                                 # Assign new cell id to one side of the splitted cell
-                                if (pos - old_center).dot(split_direction) > 0:
+                                if (pos - old_center).dot(split_direction) > 1e-6:
                                     self.grid[i, j].cell_id = new_cell_id
                                     ti.atomic_add(new_current_size, 1)
                     
                     ti.atomic_add(self.n_cells[None], 1)
-                    print(f"Cell {cell_id}: Splitted. Size {self.cells[cell_id].current_volume} new cell {new_cell_id} has {new_current_size} pixels")
+                    #print(f"Cell {cell_id}: Splitted. Size {self.cells[cell_id].current_volume} new cell {new_cell_id} has {new_current_size} pixels")
                     self.cells[new_cell_id].cell_type = self.cells[cell_id].cell_type
-                    self.cells[new_cell_id].preferred_volume = self.cells[cell_id].preferred_volume                
+                    self.cells[new_cell_id].preferred_volume = self.cells[cell_id].preferred_volume            
+                    self.cells[new_cell_id].preferred_perimeter = self.cells[cell_id].preferred_perimeter
+                    self.cells[new_cell_id].preferred_polarization = self.cells[cell_id].preferred_polarization
+                    self.cells[new_cell_id].polarization_strength = self.cells[cell_id].polarization_strength
+
 
     @ti.func
     def compute_shortest_axis(self, mat: ti.math.mat2) -> ti.math.vec2:
@@ -437,7 +465,64 @@ class Simulation():
                # delta_perimter = H_per after copy - Current H_per
                delta_perimeter = self.calc_perimeter_h(i, j, t_i, t_j, self.grid[t_i, t_j].cell_id) - self.calc_perimeter_h(i, j, i, j, self.grid[i, j].cell_id)
                ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_perimeter)
+                 
+               # Polarization:
+               # delta_polarization = H_pol after copy - Current H_pol (0 gain given by src==target)
+               delta_polarization_after = self.calc_polarization_h(s_i=i, s_j=j, t_i=t_i, t_j=t_j) 
+               delta_polarization_before = self.calc_polarization_h(s_i=i, s_j=j, t_i=i, t_j=j)
+               print(f"Cell {self.grid[i, j].cell_id} Delta Polarization: {delta_polarization_after} - {delta_polarization_before}")
+               ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_polarization_after - delta_polarization_before)
+               
+    @ti.func
+    def calc_polarization_h(self, s_i: int, s_j: int, t_i:int, t_j: int) -> float:
+        """
+            Calculate the polarization energy of a pixel assuming it is copied from s to t.
+            The energy is calculated as the difference between the preferred polarization and the current polarization
+        """ 
+        s_pos = ti.Vector([float(s_i), float(s_j)])
+        t_pos = ti.Vector([float(t_i), float(t_j)])
+        total_energy = 0.0
+        N = 0
+        new_N = 0
+        gain = 0
+        if self.cells[self.grid[s_i, s_j].cell_id].current_volume > 1 and self.cells[self.grid[t_i, t_j].cell_id].current_volume > 1:
+            # A cell is not polarized if it has only one pixel
 
+            for c in range(self.n_cells[None]):
+                # All cells that are not source or target will keep the same polarization so they are not considered
+                if c > 0 and (c == self.grid[s_i, s_j].cell_id or c == self.grid[t_i, t_j].cell_id):
+                    N = self.cells[c].current_volume
+                    if (c == self.grid[s_i, s_j].cell_id):
+                        # Source is gaining a pixel
+                        gain = 1.0
+                    if (c == self.grid[t_i, t_j].cell_id):
+                        # Target is losing a pixel
+                        gain = -1.0
+
+                    new_N = self.cells[c].current_volume + gain
+                    # To compute the polarization energy after copy, we need to compute to consider that a gain/loss of pixel changes:
+                    # 1. The center of mass
+                    new_center = ti.Vector([0.0, 0.0])
+                    
+                    if (c == self.grid[s_i, s_j].cell_id):
+                        new_center = (N * self.cells[c].center + t_pos) / new_N
+                    elif (c == self.grid[t_i, t_j].cell_id):
+                        new_center = (N * self.cells[c].center - t_pos) / new_N
+                    
+                    # 2. The covariance matrix
+                    # Instead of recomputing the covariance matrix, we can use the current one and adjust it based on the new center of mass
+                    # I.e., we assume the old pixels are still there, but the new pixel changes the center of mass and the covariance matrix
+                    new_covariance_matrix = (1 / new_N) * (N * self.cells[c].covariance_matrix + gain*(new_center - t_pos).outer_product(new_center - t_pos))
+                    # 3. The polarization vector (longest axis of the covariance matrix)
+                    new_polarization_vector = self.compute_longest_axis(new_covariance_matrix)
+                    preferred_polarization = self.cells[c].preferred_polarization
+                    alignment = new_polarization_vector.dot(preferred_polarization)
+                    #print(f"Cell {c} New Polarization: {new_polarization_vector}, Preferred: {preferred_polarization}, Alignment: {alignment}")
+                    # TODO: Polarization strength
+                    # TODO: When called with same source and target, should return the current polarization energy
+
+                    ti.atomic_add(total_energy, self.lambda_polarization * (1.0 - alignment)**2)
+        return total_energy
 
     def cpm_step(self):
         # Sources and targets are stored into .selected* and .copy_*
@@ -502,13 +587,17 @@ sim_config = {
     "size": 1024,
     "max_cell_types": 10,
     "max_cells": 100000,
+    "temperature": 5.0,
     "lambda_volume": 1,
     "lambda_perimeter": .5,
+    "lambda_polarization": 100,
     "cell_types": [
         {
             "j_adhesion_stroma": 0.000,
             "j_adhesion_other": .5,
             "preferred_volume_stats": [0.0005, 0.0001],
+            "preferred_polarization_stats": [1.0, 0.1],
+            "preferred_polarization_strength_stats": [1.0, 0.1]
          }
     ]
 }
