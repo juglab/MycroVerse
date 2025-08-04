@@ -22,6 +22,7 @@ class Cell():
     current_perimeter: float
     center: ti.math.vec2
     should_split: int
+    covariance_matrix: ti.math.mat2 # Covariance matrix for the cell's shape, used for splitting
 
 @ti.dataclass
 class CellPoint():
@@ -68,7 +69,7 @@ class Simulation():
         self.create_cell(.2, .2, 1)
         self.create_cell(.7, .7, 1)
         # Recalc all params before starting simulation
-        self.reset_grid_params()
+        self.update_grid_params()
     
     @ti.func
     def point_in_polygon(self, x:int, y:int, polygon: ti.template()) -> int: # type: ignore
@@ -160,15 +161,22 @@ class Simulation():
         return neigh
 
     @ti.kernel
-    def reset_grid_params(self):
+    def update_grid_params(self):
+        """
+            Update all grid and cell parameters based on the current grid state.
+            This includes recalculating the local perimeter, current volume and current perimeter of each cell.
+        """
+
+        # Reset all cell parameters
         for c in self.cells:
             if self.cells[c].cell_type > 0:
                 self.cells[c].current_perimeter = 0.0
                 self.cells[c].current_volume = 0.0
                 self.cells[c].center = ti.Vector([0.0, 0.0])
                 self.cells[c].should_split = 0
-                
-            
+                self.cells[c].covariance_matrix = ti.Matrix([[0.0, 0.0], [0.0, 0.0]])
+
+        # Accumulate grid parameters
         for i, j in self.grid:
             self.grid[i, j].local_perimeter = self.local_perimeter(i, j, self.grid[i, j].cell_id)
             self.grid[i, j].is_membrane = int(self.grid[i, j].local_perimeter > 0)  
@@ -182,16 +190,30 @@ class Simulation():
                 # Use center as accumulator temporarily
                 ti.atomic_add(self.cells[self.grid[i, j].cell_id].center.x, float(i))
                 ti.atomic_add(self.cells[self.grid[i, j].cell_id].center.y, float(j))
-
         
         # Calculate center of mass
         for c in self.cells:
             if self.cells[c].current_volume > 0:
+                # Center of mass
                 self.cells[c].center /= self.cells[c].current_volume
                 #print(f"Cell {c} Center: {self.cells[c].center[0]} {self.cells[c].center[1]}")
                 # Recompute preferred perimeter to keep roundness based on current volume
                 self.cells[c].preferred_perimeter = 2 * math.pi * ti.sqrt(self.cells[c].preferred_volume / math.pi)
-                
+        
+        # Second pass (computations that depends on center of mass / preferred perimeter / etc)
+        for i, j in self.grid:
+            if self.grid[i, j].cell_id > 0:
+                # Update covariance matrix
+                diff = self.cells[self.grid[i, j].cell_id].center - ti.Vector([float(i), float(j)])
+
+                # Using outer product to accumulate covariance
+                self.cells[self.grid[i, j].cell_id].covariance_matrix += ti.Matrix([[diff.x * diff.x, diff.x * diff.y],
+                                                                [diff.x * diff.y, diff.y * diff.y]])
+                                                                     
+        for c in self.cells:
+            if self.cells[c].current_volume > 0:
+                # Normalize covariance matrix
+                self.cells[c].covariance_matrix /= self.cells[c].current_volume
 
     @ti.kernel
     def do_copy(self):
@@ -216,7 +238,8 @@ class Simulation():
                 if new_cell_id < self.max_cells:    
                     # Split from center to a random direction
                     old_center = self.cells[cell_id].center
-                    split_direction = ti.Vector([ti.random() - 0.5, ti.random() - 0.5]).normalized()
+                    # split_direction = ti.Vector([ti.random() - 0.5, ti.random() - 0.5]).normalized()
+                    split_direction = self.compute_longest_axis(self.cells[cell_id].covariance_matrix)
                     # Taichi does not support dynamic nested fors......
                     new_current_size = 0
                     for i in range(self.size):
@@ -232,6 +255,67 @@ class Simulation():
                     print(f"Cell {cell_id}: Splitted. Size {self.cells[cell_id].current_volume} new cell {new_cell_id} has {new_current_size} pixels")
                     self.cells[new_cell_id].cell_type = self.cells[cell_id].cell_type
                     self.cells[new_cell_id].preferred_volume = self.cells[cell_id].preferred_volume                
+
+    @ti.func
+    def compute_shortest_axis(self, mat: ti.math.mat2) -> ti.math.vec2:
+        # Extract symmetric matrix components
+        a = mat[0, 0]
+        b = mat[0, 1]  # = mat[1, 0]
+        d = mat[1, 1]
+
+        # Compute eigenvalues
+        trace = a + d
+        diff = a - d
+        temp = ti.sqrt(diff * diff + 4.0 * b * b)
+        lambda_min = 0.5 * (trace - temp)  # Smallest eigenvalue
+
+        # Initialize eigenvector components (required by Taichi)
+        x = 0.0
+        y = 0.0
+
+        # Compute eigenvector associated with lambda_min
+        if b != 0.0:
+            x = lambda_min - d
+            y = b
+        else:
+            # Diagonal case
+            if a < d:
+                x = 1.0
+                y = 0.0
+            else:
+                x = 0.0
+                y = 1.0
+
+        v = ti.Vector([x, y])
+        return v.normalized()
+
+    @ti.func
+    def compute_longest_axis(self, mat: ti.math.mat2) -> ti.math.vec2:
+        a = mat[0, 0]
+        b = mat[0, 1]  # = mat[1, 0]
+        d = mat[1, 1]
+
+        trace = a + d
+        diff = a - d
+        temp = ti.sqrt(diff * diff + 4.0 * b * b)
+        lambda_max = 0.5 * (trace + temp)  # largest eigenvalue
+
+        x = 0.0
+        y = 0.0
+        if b != 0.0:
+            x = lambda_max - d
+            y = b
+        else:
+            if a > d:
+                x = 1.0
+                y = 0.0
+            else:
+                x = 0.0
+                y = 1.0
+
+        v = ti.Vector([x, y])
+        return v.normalized()
+
 
     @ti.kernel
     def select_potential_copies(self):
@@ -320,14 +404,20 @@ class Simulation():
                     else:
                         gain_perimeter = 8 - 2*same_cell_neighbors
             
-                ti.atomic_add(total_energy, self.lambda_perimeter * (current_perimeter + gain_perimeter - self.cells[c].current_volume)**2)
+                ti.atomic_add(total_energy, self.lambda_perimeter * (current_perimeter + gain_perimeter - self.cells[c].current_perimeter)**2)
 
         return total_energy
 
-        
-
     @ti.kernel
     def calc_energy(self):
+        """
+            Calculate the energy of the potential copies.
+            For each selected source pixel, calculate the energy gain of copying it into its target pixel.
+            The energy is calculated as:
+                - Adhesion delta: adhesion of source + adhesion of target - adhesion of target after copy - adhesion of source after copy
+                - Volume delta: Hvol after copy - Hvol before copy
+                - Perimeter delta: H_per after copy - H_per before copy
+        """
         for i, j in self.grid:
             if self.grid[i, j].selected_as_src:
                t_i, t_j = ti.cast(self.grid[i, j].copy_into[0], int), ti.cast(self.grid[i, j].copy_into[1], int)
@@ -357,18 +447,25 @@ class Simulation():
         self.do_copy()
 
         # Update cell grid parameters from grid:
-        self.reset_grid_params()
+        self.update_grid_params()
     
     @ti.kernel
     def check_mitosis(self):
+        """
+            Check if any cell should split based on its current volume.
+            If the current volume is greater than the preferred volume, mark it for splitting.
+        """
         for c in self.cells:
             if self.cells[c].current_volume > self.cells[c].preferred_volume:
                 self.cells[c].should_split = 1
 
     def biology_events(self):
+        """
+            Handle biological events like mitosis.
+        """
         self.check_mitosis()
         self.trigger_mitosis()
-        self.reset_grid_params()
+        self.update_grid_params()
 
 
     def update(self):
@@ -402,16 +499,16 @@ class Simulation():
 
 
 sim_config = {
-    "size": 512,
+    "size": 1024,
     "max_cell_types": 10,
-    "max_cells": 1000,
+    "max_cells": 100000,
     "lambda_volume": 1,
-    "lambda_perimeter": 0.5,
+    "lambda_perimeter": .5,
     "cell_types": [
         {
-            "j_adhesion_stroma": 0.01*8,
-            "j_adhesion_other": .1*8,
-            "preferred_volume_stats": [0.005, 0.001],
+            "j_adhesion_stroma": 0.000,
+            "j_adhesion_other": .5,
+            "preferred_volume_stats": [0.0005, 0.0001],
          }
     ]
 }
