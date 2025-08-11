@@ -3,9 +3,6 @@ import math
 import numpy as np
 from typing import List
 
-ti.init(arch=ti.cpu, debug=False)
-
-
 @ti.dataclass
 class CellType():
     j_adhesion_stroma: float
@@ -55,10 +52,17 @@ class CellPoint():
 @ti.data_oriented
 class Simulation():
     def __init__(self, sim_config):
-        self.sim_pause = ti.field(dtype=int, shape=())
-        self.display_mode = ti.field(dtype=int, shape=())
-        self.cell_selected = ti.field(dtype=int, shape=())
+        
+
+        # Set random seed for reproducibility
+    
+
         self.config = sim_config
+
+        self.seed = sim_config.get("random_seed", 0)
+        self.random = np.random.default_rng(self.seed)
+        ti.init(arch=ti.cpu, debug=False, random_seed=self.seed, cpu_max_num_threads=1) # cpu_max_num_threads=1 for reproducibility
+
         self.size = sim_config["size"]
         self.max_cells=sim_config["max_cells"]
         self.max_cell_types = sim_config["max_cell_types"]
@@ -68,6 +72,11 @@ class Simulation():
         self.lambda_polarization = sim_config["lambda_polarization"]
         self.mitosis_probability = sim_config.get("mitosis_probability", 1.0)
         self.mitosis_anisotropy_threshold = sim_config.get("mitosis_anisotropy_threshold", 0.5)
+
+        self.sim_pause = ti.field(dtype=int, shape=())
+        self.display_mode = ti.field(dtype=int, shape=())
+        self.cell_selected = ti.field(dtype=int, shape=())
+
         self.gui = ti.GUI(name="MycroVerse", res=self.size)
         self.render_grid = ti.field(dtype=float, shape=(self.size, self.size, 3))
         self.select_prob = ti.field(dtype=float, shape=())
@@ -143,11 +152,11 @@ class Simulation():
         cell_id = self.n_cells[None]
         self.n_cells[None] += 1
         self.cells[cell_id].cell_type = cell_type
-        self.cells[cell_id].preferred_volume = np.clip(np.random.normal(loc=mu_vol, scale=std_vol), .0001, 1) * self.size * self.size
-        self.cells[cell_id].preferred_polarization = ti.Vector(np.random.normal(loc=self.cell_types[cell_type].preferred_polarization_stats[0],
+        self.cells[cell_id].preferred_volume = np.clip(self.random.normal(loc=mu_vol, scale=std_vol), .0001, 1) * self.size * self.size
+        self.cells[cell_id].preferred_polarization = ti.Vector(self.random.normal(loc=self.cell_types[cell_type].preferred_polarization_stats[0],
                                                                                  scale=self.cell_types[cell_type].preferred_polarization_stats[1], size=2)).normalized()
         print(f"Created Cell {cell_id} Type {cell_type} Preferred Volume: {self.cells[cell_id].preferred_volume}, Preferred Polarization: {self.cells[cell_id].preferred_polarization}")
-        self.cells[cell_id].polarization_strength = np.clip(np.random.normal(loc=self.cell_types[cell_type].preferred_polarization_strength_stats[0],
+        self.cells[cell_id].polarization_strength = np.clip(self.random.normal(loc=self.cell_types[cell_type].preferred_polarization_strength_stats[0],
                                                                                   scale=self.cell_types[cell_type].preferred_polarization_strength_stats[1]), 0.0, 1.0)
        
         
@@ -665,7 +674,7 @@ class Simulation():
                 v = self.cells[c].current_volume
                 v0 = self.cells[c].preferred_volume
                 vol_prob = (1.0 / (1.0 + ti.exp(-k * (v - v0))))
-                print(f"Vol Prob for cell {c}: {vol_prob} (Current Volume: {v}, Preferred Volume: {v0})")
+                #print(f"Vol Prob for cell {c}: {vol_prob} (Current Volume: {v}, Preferred Volume: {v0})")
                 if ti.random() < vol_prob and self.cells[c].current_anisotropy > self.mitosis_anisotropy_threshold and ti.random() < self.mitosis_probability:
                     self.cells[c].should_split = 1
 
@@ -780,11 +789,12 @@ class Simulation():
 
 
 sim_config = {
+    "random_seed": 42,
     "size": 1024,
     "max_cell_types": 10,
     "max_cells": 100000,
     "temperature": 0.1,
-    "lambda_volume": 1,
+    "lambda_volume": 10,
     "lambda_perimeter": 5,
     "lambda_polarization": 1,
     "mitosis_anisotropy_threshold": 0.02,
@@ -792,7 +802,7 @@ sim_config = {
     "cell_types": [
         {
             "j_adhesion_stroma": 0.0,
-            "j_adhesion_other": .1,
+            "j_adhesion_other": .02,
             "preferred_volume_stats": [0.005, 0.0001],
             "preferred_polarization_stats": [0.0, 0.1],
             "preferred_polarization_strength_stats": [1.0, 0.1]
