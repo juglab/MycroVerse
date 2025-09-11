@@ -662,7 +662,7 @@ class Simulation():
                 ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_orientation_anisotropy)
  
                 # Avoid invading other cells
-                if self.grid[t_i, t_j].cell_id > 0 and self.grid[t_i, t_j].cell_id > 0:
+                if self.grid[i, j].cell_id > 0 and self.grid[t_i, t_j].cell_id > 0:
                     ti.atomic_add(self.grid[i, j].copy_energy_delta, self.lambda_invasion_penalty)
  
  
