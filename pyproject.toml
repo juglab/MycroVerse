@@ -35,7 +35,9 @@ dependencies = [
 "tqdm",
 "scikit-image",
 "pyyaml",
-"IPython"
+"IPython",
+"taichi",
+"perlin_numpy"
 ]
 
 [project.urls]

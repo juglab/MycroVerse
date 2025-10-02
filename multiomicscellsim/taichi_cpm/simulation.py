@@ -3,100 +3,17 @@ import math
 import numpy as np
 from perlin_numpy import generate_perlin_noise_2d
 from typing import List
-
-@ti.dataclass
-class CellType():
-    j_adhesion_stroma: float
-    j_adhesion_other: float
-    preferred_volume_stats: ti.math.vec2 # mean and std for preferred volume
-    preferred_anisotropy_stats: ti.math.vec2 # mean and std for preferred anisotropy
-    preferred_orientation_stats: ti.math.mat2 # mean and std for preferred orientation (2D vector)
-    mitosis_age_stats: ti.math.vec2 # mean and std for mitosis age
-    
-@ti.dataclass
-class Cell():
-    # Identifiers
-    cell_id: int
-    cell_type: int
-    
-    # Preferred parameters
-    preferred_volume: float
-    preferred_perimeter: float
-    # preferred_polarization: ti.math.vec2 # Preferred polarization vector for the cell
-    preferred_anisotropy: float # Preferred anisotropy value for the cell (How much the cell is elongated)
-    preferred_major_axis: ti.math.vec2 # Preferred major axis (orientation) of the cell's shape
-
-    # Current parameters
-    current_volume: float
-    current_perimeter: float
-    current_anisotropy: float # Current anisotropy value for the cell (How much the cell is elongated)
-    current_age: float # Current age of the cell, used for mitosis and other behaviors
-
-    center: ti.math.vec2 # Center of mass
-    maj_axis: ti.math.vec2 # Major axis of the cell's shape
-    min_axis: ti.math.vec2 # Minor axis of the cell's shape
-    max_eigenvalue: float # Maximum eigenvalue of the covariance matrix
-    min_eigenvalue: float # Minimum eigenvalue of the covariance matrix
-    covariance_matrix: ti.math.mat2 # Covariance matrix for the cell's shape, used for splitting
-
-    # Current energy terms (pre-computed for performance)
-    current_volume_energy: float # Current volume energy for the cell
-    current_perimeter_energy: float # Current perimeter energy for the cell
-    current_ellipse_energy: float # Current ellipse energy for the cell
-    current_orientation_energy: float # Current orientation energy for the cell
-    current_anisotropy_energy: float # Current anisotropy energy for the cell
-
-    # Mitosis Probabilities
-    mitosis_prob_volume: float
-    mitosis_prob_age: float
-    mitosis_age_threshold: float
-
-    # Behavioral parameters
-    should_split: int # Flag to indicate if the cell should split (1) or not (0) in the next step
-    
-    def print_debug(self):
-        print(f" Cell {self.cell_id}: Type {self.cell_type}")
-        print(f"  Age (current / mitosis thr.): {self.current_age} / {self.mitosis_age_threshold}")
-        print(f"  Volume (current / preferred): {self.current_volume} / {self.preferred_volume} (<{self.current_volume / self.preferred_volume if self.preferred_volume > 0 else 0:.2f}>)")
-        print(f"  Perimeter (current / preferred): {self.current_perimeter} / {self.preferred_perimeter} (<{self.current_perimeter / self.preferred_perimeter if self.preferred_perimeter > 0 else 0:.2f}>)")
-        print(f"  Orientation (current / preferred): {self.maj_axis} / {self.preferred_major_axis} (<{math.degrees(math.atan2(self.maj_axis[1], self.maj_axis[0])):.2f}°>)")
-        print(f"  Anisotropy (current / preferred): {self.current_anisotropy} / {self.preferred_anisotropy} (<{self.current_anisotropy / self.preferred_anisotropy if self.preferred_anisotropy > 0 else 0:.2f}>)")
-        print(f"  Center: {self.center}")
-        print(f"  Major Axis: {self.maj_axis} (Degree: {math.degrees(math.atan2(self.maj_axis[1], self.maj_axis[0]))})")
-        print(f"  Minor Axis: {self.min_axis} (Degree: {math.degrees(math.atan2(self.min_axis[1], self.min_axis[0]))})")
-        print(f"  Should Split: {self.should_split}")
-        print(f"  Covariance Matrix: {self.covariance_matrix}")
-        print(f"  Anisotropy: {self.current_anisotropy}")
-        print(f"  Current Energy: {self.current_volume_energy + self.current_perimeter_energy + self.current_anisotropy_energy + self.current_orientation_energy}")
-        print(f"  Current Volume Energy: {self.current_volume_energy}")
-        print(f"  Current Perimeter Energy: {self.current_perimeter_energy}")
-        print(f"  Current Anisotropy Energy: {self.current_anisotropy_energy}")
-        print(f"  Current Orientation Energy: {self.current_orientation_energy}")
-        print(f"  Mitosis Probabilities: Age {self.mitosis_prob_age}, Volume {self.mitosis_prob_volume}")
-
-@ti.dataclass
-class CellPoint():
-    cell_id: int
-    cell_type: int
-    is_membrane: int # 1 if it is a membrane (has neighbors with different cell_id)
-    local_perimeter: int # number of neighbors with different cell_id
-    selected_as_src: int
-    selected_as_trg: int
-    copy_into: ti.math.vec2
-    copy_from: ti.math.vec2
-    copy_energy_delta: float
+from entities import Cell, CellPoint, CellType, MAX_ENERGY_TERMS
+from utils import point_in_polygon, get_polygon_edges, local_perimeter
+from config.constraints import constraint_factory
 
 
 @ti.data_oriented
 class Simulation():
     def __init__(self, sim_config):
         
-
         # Set random seed for reproducibility
-    
-
         self.config = sim_config
-
         self.seed = sim_config.get("random_seed", 0)
         self.random = np.random.default_rng(self.seed)
         ti.init(arch=ti.cpu, debug=False, random_seed=self.seed, cpu_max_num_threads=1) # cpu_max_num_threads=1 for reproducibility
@@ -109,9 +26,18 @@ class Simulation():
         self.select_prob = ti.field(dtype=float, shape=())
         self.select_prob[None] = sim_config.get("selection_probability", 0.5) # Probability of selecting a cell for copying
 
+        # Define constraints
+        self.constraints = []
+        self.constraints_names = []
+        
+        for constraint_config in sim_config["constraints"]:
+            new_constraint = constraint_factory(constraint_config, self)
+            self.constraints.append(new_constraint)
+            self.constraints_names.append(new_constraint.energy_term_name)
+
+        self.n_constraints = len(self.constraints)
+
         # Simulation-wide energy coefficients
-        self.lambda_volume = sim_config["lambda_volume"]
-        self.lambda_perimeter = sim_config["lambda_perimeter"]
         self.lambda_chemotaxis = sim_config.get("lambda_chemotaxis", 10)
         self.lambda_orientation = sim_config.get("lambda_orientation", 1.0)
         self.lambda_anisotropy = sim_config.get("lambda_anisotropy", 1.0)
@@ -164,7 +90,7 @@ class Simulation():
     
     def chemokine_setup(self):
         """
-            Pre-compute all numpy-related components that depends on a different seed and does not support 
+            Pre-compute all numpy-related components that depends on a different seed and does not support external RNG state.
         """
         # Save current global RNG state
         state = np.random.get_state()
@@ -178,47 +104,15 @@ class Simulation():
         # Restore original global RNG state
         np.random.set_state(state)
 
-    @ti.func
-    def point_in_polygon(self, x:int, y:int, polygon: ti.template()) -> int: # type: ignore
-        """ 
-            Ray-casting algorithm to check if a point is inside a polygon 
-            Args:
-                x, y: coordinates to test
-                polygon: a 2D vector field containing the edges of the polygon
-        """
-        count = 0
-        n_verts = polygon.shape[0]
-        for i in range(n_verts):
-            a, b = polygon[i], polygon[(i+1) % n_verts]
-            if (a.y > y) != (b.y > y):  # Edge crosses the horizontal line at y
-                slope = (b.x - a.x) / (b.y - a.y)
-                intersect_x = a.x + slope * (y - a.y)
-                if x < intersect_x:  # Count only if intersection is to the right
-                    count += 1
-        return ti.cast(count % 2 == 1, int)
-
-    @ti.kernel
-    def get_polygon_edges(self, xc: float, yc:float, n_edges: int, radius: float, verts: ti.template()): # type: ignore
-        """
-            Update verts to contain the edges of a polygon
-        """
-        angle_step = 2 * math.pi / n_edges
-        for i in range(n_edges):
-            angle = i * angle_step
-            c = ti.cast((xc + radius * ti.cos(angle))*self.size, int)
-            r = ti.cast((yc + radius * ti.sin(angle))*self.size, int)
-            verts[i] = [r, c]
 
     @ti.kernel
     def draw_polygon_on_grid(self, polygon:ti.template(), cell_id:int, cell_type:int): # type: ignore
         for i, j in self.grid:
-            if self.point_in_polygon(i, j, polygon=polygon):
+            if point_in_polygon(i, j, polygon=polygon):
                 self.grid[i,j].cell_id = cell_id
                 self.grid[i,j].cell_type = cell_type
 
-
     def create_cell(self, xc: float, yc: float, cell_type:int):
-        
         # Sample params from stats
         mu_vol, std_vol = self.cell_types[cell_type].preferred_volume_stats
         cell_id = self.n_cells[None]
@@ -242,28 +136,13 @@ class Simulation():
         radius = 0.02
         n_edges = 16
         verts = ti.Vector.field(n=2, dtype=int, shape=(n_edges,))
-        self.get_polygon_edges(xc, yc, n_edges=n_edges, radius=radius, verts=verts)
+        get_polygon_edges(xc, yc, n_edges=n_edges, radius=radius, grid_size=self.size, verts=verts)
         self.draw_polygon_on_grid(polygon=verts, cell_id=cell_id, cell_type=cell_type)
         
 
     @ti.func
     def is_out_of_bounds(self, i:int, j:int) -> int:
         return ti.cast(i< 0 or i >= self.size or j<0 or j>=self.size, int)
-
-    @ti.func
-    def local_perimeter(self, i, j, grid_value) -> int:
-        """
-            Returns the local perimeter of a pixel in the grid assuming the given grid_value as cell_id.
-            (This allows to calculate the perimeter of a pixel assuming it is part of a different cell)
-        """
-        local_perimeter = 0 
-        for i_offset in range(-1, 2):
-            for j_offset in range(-1, 2):
-                if grid_value > 0 and \
-                   not self.is_out_of_bounds(i+i_offset, j+j_offset) and \
-                   grid_value != self.grid[i+i_offset, j+j_offset].cell_id:
-                   ti.atomic_add(local_perimeter, 1)
-        return local_perimeter
 
     @ti.func
     def pick_random_neighbor(self, i, j) -> ti.Vector:
@@ -295,15 +174,13 @@ class Simulation():
                 self.cells[c].center = ti.Vector([0.0, 0.0])
                 self.cells[c].covariance_matrix = ti.Matrix([[0.0, 0.0], [0.0, 0.0]])
                 self.cells[c].current_anisotropy = 0.0
-                self.cells[c].current_volume_energy = 0.0
-                self.cells[c].current_perimeter_energy = 0.0
                 self.cells[c].maj_axis = ti.Vector([0.0, 0.0])
                 self.cells[c].min_axis = ti.Vector([0.0, 0.0])
 
 
-        # Accumulate grid parameters
+        # Accumulate grid parameters (operations on pixels)
         for i, j in self.grid:
-            self.grid[i, j].local_perimeter = self.local_perimeter(i, j, self.grid[i, j].cell_id)
+            self.grid[i, j].local_perimeter = local_perimeter(self, i, j, self.grid[i, j].cell_id)
             self.grid[i, j].is_membrane = int(self.grid[i, j].local_perimeter > 0)  
             self.grid[i, j].selected_as_src = 0
             self.grid[i, j].selected_as_trg = 0
@@ -349,8 +226,6 @@ class Simulation():
                 a = ti.sqrt(self.cells[c].max_eigenvalue)
                 b = ti.sqrt(self.cells[c].min_eigenvalue)
 
-                # Optional: Rescale to match actual area (N pixels)
-                # Because area = πab, and you know N:
                 scaling_factor = ti.sqrt(self.cells[c].current_volume / (ti.math.pi * a * b))
                 a *= scaling_factor
                 b *= scaling_factor
@@ -360,10 +235,10 @@ class Simulation():
                 self.cells[c].preferred_perimeter = 3 * ti.math.pi * (a + b) * (1 + (3 * h) / (10 + ti.sqrt(4 - 3 * h)))
 
                 # Recompute energy terms
-                self.cells[c].current_volume_energy = self.lambda_volume * (self.cells[c].current_volume - self.cells[c].preferred_volume) ** 2
-                #self.cells[c].current_volume_energy = self.lambda_volume * ((self.cells[c].current_volume - self.cells[c].preferred_volume) / self.cells[c].preferred_volume) ** 2
-                self.cells[c].current_perimeter_energy = self.lambda_perimeter * (self.cells[c].current_perimeter - self.cells[c].preferred_perimeter) ** 2
-                #self.cells[c].current_perimeter_energy = self.lambda_perimeter * ((self.cells[c].current_perimeter - self.cells[c].preferred_perimeter) / self.cells[c].preferred_perimeter) ** 2
+                # TODO: Remove after implementing all constraints
+                # FIXME: Find a solution for this. We cannot iterate over constraints in Taichi
+                for cid in ti.static(range(self.n_constraints)):
+                    self.cells[c].current_energy_terms[self.constraints[cid].energy_index] = self.constraints[cid].calculate_current_cell_energy(c)
 
                 self.cells[c].current_anisotropy_energy = self.lambda_anisotropy * (self.cells[c].current_anisotropy - self.cells[c].preferred_anisotropy) ** 2
                 self.cells[c].current_orientation_energy = self.lambda_orientation * (1.0 - self.cells[c].maj_axis.dot(self.cells[c].preferred_major_axis.normalized())) ** 2
@@ -372,6 +247,7 @@ class Simulation():
                 k = 0.01 # Slope of sigmoid
                 self.cells[c].mitosis_prob_volume = (1.0 / (1.0 + ti.exp(-k * (self.cells[c].current_volume - self.cells[c].preferred_volume))))
                 self.cells[c].mitosis_prob_age = (1.0 / (1.0 + ti.exp(-k * (self.cells[c].current_age - self.cells[c].mitosis_age_threshold))))
+
 
     @ti.kernel
     def do_copy(self):
@@ -442,7 +318,7 @@ class Simulation():
 
 
     @ti.func
-    def compute_eigenvectors_and_eigenvalues(self, mat: ti.math.mat2) -> ti.math.vec2:
+    def compute_eigenvectors_and_eigenvalues(self, mat: ti.math.mat2) -> ti.math.vec2: # type: ignore
         eigvals, eigvects = ti.sym_eig(mat)
         # Compare the eigenvalues explicitly
         # Depending on their order, select correctly
@@ -559,53 +435,6 @@ class Simulation():
         return total
 
 
-    @ti.func
-    def calc_volume_h(self, src_cell_id: int, tgt_cell_id: int) -> float:
-        total_energy = 0.0
-        # Taichi does not support nested for...
-        for c in range(self.n_cells[None]):
-            if c > 0:
-                if c == src_cell_id or c == tgt_cell_id:
-                    gain = 0.0
-                    if src_cell_id == c:
-                        # Current Volume gain one pixel
-                        gain += 1.0
-                    if tgt_cell_id == c:
-                        # Current Volume loses one pixel
-                        gain -= 1.0
-                    total_energy += self.lambda_volume * (self.cells[c].current_volume + gain - self.cells[c].preferred_volume)**2
-                    #total_energy += self.lambda_volume * ((self.cells[c].current_volume + gain - self.cells[c].preferred_volume)/( self.cells[c].preferred_volume))**2
-        return total_energy
-
-    @ti.func
-    def calc_perimeter_h(self, s_i:int, s_j:int, t_i:int, t_j:int, t_value:int) -> float:
-        """
-            Calculate the perimeter energy of a pixel assuming it is copied from s to t.
-            To calculate the current perimeter, pass the same i,j as s_i, s_j and t_i, t_j
-        """
-        total_energy = 0.0
-
-        for c in range(self.n_cells[None]):
-            # All cells that are not source or target will keep the same perimeter so they are not considered
-            
-            if c > 0 and (c == t_value or c == self.grid[s_i, s_j].cell_id):
-                gain_perimeter = 0.0
-                current_perimeter = self.cells[c].current_perimeter
-
-                # If the source and target are the same, we have no gain, otherwise...
-                if s_i != t_i or s_j != t_j:
-                    # We just consider the neighborhood of the target pixel (which is the only one that changes)
-                    same_cell_neighbors = 8 - self.local_perimeter(t_i, t_j, c)
-                    if c == t_value:
-                        gain_perimeter = -8 + 2*same_cell_neighbors
-                    else:
-                        gain_perimeter = 8 - 2*same_cell_neighbors
-
-                ti.atomic_add(total_energy, self.lambda_perimeter * (current_perimeter + gain_perimeter - self.cells[c].preferred_perimeter)**2)
-                #ti.atomic_add(total_energy, self.lambda_perimeter * ((current_perimeter + gain_perimeter - self.cells[c].preferred_perimeter)/(self.cells[c].preferred_perimeter))**2)
-
-        return total_energy
-
     @ti.kernel
     def calc_energy(self):
         """
@@ -628,19 +457,9 @@ class Simulation():
                 delta_adhesion = adhesion_after - adhesion_current
                 ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_adhesion)
  
-                # Volume: Hvol after copy - Current Hvol (0 gain given by src==target)
-                delta_volume_current = self.cells[self.grid[i, j].cell_id].current_volume_energy + self.cells[self.grid[t_i, t_j].cell_id].current_volume_energy
-                
-                delta_volume_after = self.calc_volume_h(src_cell_id=self.grid[i, j].cell_id, tgt_cell_id=self.grid[t_i, t_j].cell_id)
-                delta_volume =  (delta_volume_after - delta_volume_current)
-                ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_volume)
- 
-                # Perimeter:
-                # delta_perimter = H_per after copy - Current H_per
-                delta_perimeter_current = self.cells[self.grid[i, j].cell_id].current_perimeter_energy + self.cells[self.grid[t_i, t_j].cell_id].current_perimeter_energy
-                delta_perimeter_after = self.calc_perimeter_h(i, j, t_i, t_j, self.grid[t_i, t_j].cell_id)
-                delta_perimeter = delta_perimeter_after - delta_perimeter_current
-                ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_perimeter)
+                # FIXME: Find a solution for this. We cannot iterate over constraints in Taichi
+                for cid in ti.static(range(self.n_constraints)):
+                    ti.atomic_add(self.grid[i, j].copy_energy_delta, self.constraints[cid].calculate_energy_delta(s_i=i, s_j=j, t_i=t_i, t_j=t_j))
                   
                 # Polarization Bias:
                 # This is a bias term that encourages cells to copy in the direction of their preferred major axis
@@ -673,8 +492,8 @@ class Simulation():
                    print(f"Cell {self.cell_selected[None]} Selected. Copying from {i}, {j} to {t_i}, {t_j}")
                    print(f"Copy from {i}, {j} ({self.grid[i, j].cell_id}) to {t_i}, {t_j} ({self.grid[t_i, t_j].cell_id})")
                    print(f"Adhesion Energy (Current/After): {adhesion_current} / {adhesion_after} = {delta_adhesion}")
-                   print(f"Volume Energy (Current/After): {delta_volume_current} / {delta_volume_after} = {delta_volume}")
-                   print(f"Perimeter Energy (Current/After): {delta_perimeter_current} / {delta_perimeter_after} = {delta_perimeter}")
+                   #print(f"Volume Energy (Current/After): {delta_volume_current} / {delta_volume_after} = {delta_volume}")
+                   #print(f"Perimeter Energy: {delta_perimeter}")
                    print(f"Orientation/Anisotropy Energy (Current/After): {orientation_anisotropy_before} / {orientation_anisotropy_after} = {delta_orientation_anisotropy}")
                    print(f"Chemotaxis Energy: {chemotaxis_h}")
 
@@ -943,6 +762,7 @@ class Simulation():
             self.draw()
 
 
+from config.constraints import PerimeterConstraintConfig, VolumeConstraintConfig
 
 sim_config = {
     "random_seed": 42,
@@ -962,6 +782,10 @@ sim_config = {
     "mitosis_probability": 0.2,
     "chemokine_seed": 0,
     "chemokine_noise_scale": 7,
+    "constraints": [
+        VolumeConstraintConfig(lambda_weight=1e-3, energy_index=0),
+        PerimeterConstraintConfig(lambda_weight=1e-3, energy_index=1)
+    ],
     "cell_types": [
         {
             "j_adhesion_stroma": 0.0,
