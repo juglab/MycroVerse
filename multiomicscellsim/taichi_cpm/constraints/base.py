@@ -37,13 +37,5 @@ class Constraint(ABC):
         """
         pass
 
-    @abstractmethod
-    def on_behaviour_update(self, *args, **kwargs):
-        """
-            Called at each behaviour update step to allow the constraint to update energy terms based on current simulation state.
-        """
-        pass
-
-
 
 

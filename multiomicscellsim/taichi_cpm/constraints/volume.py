@@ -51,7 +51,3 @@ class VolumeConstraint(Constraint):
         delta_perimeter_current = current_energy_source + current_energy_target
         delta_volume_after = self.calculate_copy_energy(s_i, s_j, t_i, t_j)
         return delta_volume_after - delta_perimeter_current
-    
-    @ti.func
-    def on_behaviour_update(self):
-        return super().on_behaviour_update(*args, **kwargs)

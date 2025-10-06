@@ -67,3 +67,15 @@ def get_polygon_edges(xc: float, yc:float, n_edges: int, radius: float, grid_siz
         c = ti.cast((xc + radius * ti.cos(angle))*grid_size, int)
         r = ti.cast((yc + radius * ti.sin(angle))*grid_size, int)
         verts[i] = [r, c]
+
+@ti.func
+def compute_eigenvectors_and_eigenvalues(mat: ti.math.mat2) -> ti.math.vec2: # type: ignore
+    eigvals, eigvects = ti.sym_eig(mat)
+    # Compare the eigenvalues explicitly
+    # Depending on their order, select correctly
+    cond = eigvals[0] > eigvals[1]
+    longest_axis = ti.select(cond, eigvects[:, 0], eigvects[:, 1])
+    shortest_axis = ti.select(cond, eigvects[:,  1], eigvects[:, 0])
+    longest_eigenvalue = ti.select(cond, eigvals[0], eigvals[1])
+    shortest_eigenvalue = ti.select(cond, eigvals[1], eigvals[0])
+    return longest_axis, shortest_axis, longest_eigenvalue, shortest_eigenvalue

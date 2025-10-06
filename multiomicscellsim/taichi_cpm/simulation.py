@@ -4,7 +4,7 @@ import numpy as np
 from perlin_numpy import generate_perlin_noise_2d
 from typing import List
 from entities import Cell, CellPoint, CellType, MAX_ENERGY_TERMS
-from utils import point_in_polygon, get_polygon_edges, local_perimeter
+from utils import point_in_polygon, get_polygon_edges, local_perimeter, compute_eigenvectors_and_eigenvalues
 from config.constraints import constraint_factory
 
 
@@ -27,6 +27,7 @@ class Simulation():
         self.select_prob[None] = sim_config.get("selection_probability", 0.5) # Probability of selecting a cell for copying
 
         # Define constraints
+        assert len(sim_config["constraints"]) <= MAX_ENERGY_TERMS, f"Number of constraints exceeds MAX_ENERGY_TERMS ({MAX_ENERGY_TERMS})"
         self.constraints = []
         self.constraints_names = []
         
@@ -36,13 +37,6 @@ class Simulation():
             self.constraints_names.append(new_constraint.energy_term_name)
 
         self.n_constraints = len(self.constraints)
-
-        # Simulation-wide energy coefficients
-        self.lambda_chemotaxis = sim_config.get("lambda_chemotaxis", 10)
-        self.lambda_orientation = sim_config.get("lambda_orientation", 1.0)
-        self.lambda_anisotropy = sim_config.get("lambda_anisotropy", 1.0)
-        self.lambda_invasion_penalty = sim_config.get("lambda_invasion_penalty", 0)
-        self.lambda_repulsion = sim_config.get("lambda_repulsion", 0)
 
         # Behavioral parameters
         self.mitosis_probability = sim_config.get("mitosis_probability", 1.0)
@@ -215,7 +209,7 @@ class Simulation():
                 # Normalize covariance matrix
                 self.cells[c].covariance_matrix /= self.cells[c].current_volume
                 # Compute current orientation as the longest axis of the covariance matrix
-                self.cells[c].maj_axis, self.cells[c].min_axis, self.cells[c].max_eigenvalue, self.cells[c].min_eigenvalue = self.compute_eigenvectors_and_eigenvalues(self.cells[c].covariance_matrix)
+                self.cells[c].maj_axis, self.cells[c].min_axis, self.cells[c].max_eigenvalue, self.cells[c].min_eigenvalue = compute_eigenvectors_and_eigenvalues(self.cells[c].covariance_matrix)
                 self.cells[c].current_anisotropy = (self.cells[c].max_eigenvalue - self.cells[c].min_eigenvalue) / (self.cells[c].max_eigenvalue + self.cells[c].min_eigenvalue + 1e-6)
 
             # Update behavior
@@ -235,13 +229,9 @@ class Simulation():
                 self.cells[c].preferred_perimeter = 3 * ti.math.pi * (a + b) * (1 + (3 * h) / (10 + ti.sqrt(4 - 3 * h)))
 
                 # Recompute energy terms
-                # TODO: Remove after implementing all constraints
-                # FIXME: Find a solution for this. We cannot iterate over constraints in Taichi
                 for cid in ti.static(range(self.n_constraints)):
                     self.cells[c].current_energy_terms[self.constraints[cid].energy_index] = self.constraints[cid].calculate_current_cell_energy(c)
 
-                self.cells[c].current_anisotropy_energy = self.lambda_anisotropy * (self.cells[c].current_anisotropy - self.cells[c].preferred_anisotropy) ** 2
-                self.cells[c].current_orientation_energy = self.lambda_orientation * (1.0 - self.cells[c].maj_axis.dot(self.cells[c].preferred_major_axis.normalized())) ** 2
 
                 # Compute mitosis probabilities
                 k = 0.01 # Slope of sigmoid
@@ -251,6 +241,10 @@ class Simulation():
 
     @ti.kernel
     def do_copy(self):
+        """
+            Perform the copy of the selected pixels based on the calculated energy deltas and the Metropolis criterion.
+            If the copy is accepted, update the target pixel's cell_id and cell_type.
+        """
 
         for i, j in self.grid:
             if self.grid[i, j].selected_as_src:
@@ -276,7 +270,11 @@ class Simulation():
 
     @ti.kernel
     def trigger_mitosis(self):
-        
+        """
+            Check for cells that should undergo mitosis based on their mitosis probability and anisotropy threshold.
+            If a cell is set to divide, mark it for splitting in the next step.
+        """
+
         for cell_id in range(self.n_cells[None]):
             if cell_id > 0 and self.cells[cell_id].should_split > 0:
                 new_cell_id = self.n_cells[None]
@@ -284,10 +282,7 @@ class Simulation():
                 if new_cell_id < self.max_cells:    
                     # Split from center to a random direction
                     old_center = self.cells[cell_id].center
-                    #split_direction = ti.Vector([ti.random() - 0.5, ti.random() - 0.5]).normalized()
                     split_direction = self.cells[cell_id].maj_axis.normalized() # Use the major axis as the split direction
-                    #print(f"Cell {cell_id} Splitting. Orientation: {self.cells[cell_id].maj_axis}, Direction: {split_direction}, Center: {old_center}")
-                    #split_direction = self.cells[cell_id].current_polarization.normalized()
                     # Taichi does not support dynamic nested fors......
                     new_current_size = 0
                     for i in range(self.size):
@@ -301,7 +296,6 @@ class Simulation():
                     
                     self.cells[cell_id].should_split = 0
                     ti.atomic_add(self.n_cells[None], 1)
-                    #print(f"Cell {cell_id}: Splitted. Size {self.cells[cell_id].current_volume} new cell {new_cell_id} has {new_current_size} pixels")
                     
                     # TODO: Here we could implement mutations and stochasticity
                     self.cells[new_cell_id].cell_type = self.cells[cell_id].cell_type
@@ -315,24 +309,14 @@ class Simulation():
                     # FIXME: Is this correct?
                     self.cells[cell_id].current_age = 0.0
 
-
-
-    @ti.func
-    def compute_eigenvectors_and_eigenvalues(self, mat: ti.math.mat2) -> ti.math.vec2: # type: ignore
-        eigvals, eigvects = ti.sym_eig(mat)
-        # Compare the eigenvalues explicitly
-        # Depending on their order, select correctly
-        cond = eigvals[0] > eigvals[1]
-        longest_axis = ti.select(cond, eigvects[:, 0], eigvects[:, 1])
-        shortest_axis = ti.select(cond, eigvects[:,  1], eigvects[:, 0])
-        longest_eigenvalue = ti.select(cond, eigvals[0], eigvals[1])
-        shortest_eigenvalue = ti.select(cond, eigvals[1], eigvals[0])
-
-        return longest_axis, shortest_axis, longest_eigenvalue, shortest_eigenvalue
-
    
     @ti.kernel
     def select_potential_copies(self):
+        """
+            Randomly select potential source and target pixels for copying.
+            A pixel can be selected as a source if it is a membrane pixel and not already selected
+            as a source or target. The target pixel is chosen randomly from the neighbors of the source pixel.
+        """
         for i, j in self.grid:
             if ti.random() < self.select_prob[None] and \
                self.grid[i, j].is_membrane and \
@@ -361,274 +345,36 @@ class Simulation():
                     self.grid[t_i, t_j].selected_as_trg = 1
                     self.grid[t_i, t_j].copy_from = ti.Vector([s_i, s_j], int)
     
-    @ti.func
-    def calc_adhesion(self, i:int, j:int, cell_id:int) -> float:
-        """
-            Calculate the local adhesion of a pixel considering its cell_id as the given value
-            so it can be used to simulate copies.
-        """
-        energy = 0.0
-        for i_offset in range(-1, 2):
-            for j_offset in range(-1, 2):
-                if not self.is_out_of_bounds(i+i_offset, j+j_offset) and \
-                   cell_id != self.grid[i+i_offset, j+j_offset].cell_id:
-                   if self.grid[i+i_offset, j+j_offset].cell_id == 0:
-                       ti.atomic_add(energy, self.cell_types[self.cells[cell_id].cell_type].j_adhesion_stroma)
-                   else:
-                       ti.atomic_add(energy, self.cell_types[self.cells[cell_id].cell_type].j_adhesion_other)
-        return energy
-
-    @ti.func
-    def calc_orientation_anisotropy_h(self, s_i:int, s_j:int, t_i:int, t_j:int) -> float:
-        total = 0.0
-
-        if s_i == t_i and s_j == t_j:
-            # "Current" energy of the two relevant cells
-            for c in range(self.n_cells[None]):
-                if c > 0 and (c == self.grid[s_i, s_j].cell_id or c == self.grid[t_i, t_j].cell_id):
-                    A = self.cells[c].current_anisotropy
-                    A_star = self.cells[c].preferred_anisotropy
-                    total += self.lambda_anisotropy * (A - A_star) ** 2
-                    if self.lambda_orientation > 0.0:
-                        # Use current major axis and preferred_major_axis
-                        emax = self.cells[c].maj_axis
-                        ustar = self.cells[c].preferred_major_axis.normalized()
-                        align2 = ti.min(1.0, ti.max(-1.0, emax.dot(ustar))) ** 2
-                        total += self.lambda_orientation * (1.0 - align2)
-        else:
-            # After-copy energy (rank-1 update of center & covariance), for src & tgt only
-            t_pos = ti.Vector([float(t_i), float(t_j)])
-            for c in range(self.n_cells[None]):
-                if c > 0 and (c == self.grid[s_i, s_j].cell_id or c == self.grid[t_i, t_j].cell_id):
-                    N = self.cells[c].current_volume
-                    gain = 1 if (c == self.grid[s_i, s_j].cell_id) else -1 if (c == self.grid[t_i, t_j].cell_id) else 0
-                    newN = N + gain
-                    # guard tiny cells
-                    newN = ti.max(1.0, newN)
-
-                    new_center = ti.Vector([0.0, 0.0])
-                    # center update
-                    if gain == 1:
-                        new_center = (N * self.cells[c].center + t_pos) / newN
-                    elif gain == -1:
-                        new_center = (N * self.cells[c].center - t_pos) / newN
-                    else:
-                        new_center = self.cells[c].center
-
-                    # covariance update (about new center); same pattern you already use
-                    diff = new_center - t_pos
-                    new_cov = (N * self.cells[c].covariance_matrix + gain * diff.outer_product(diff)) / newN
-
-                    # eig + anisotropy
-                    emax, emin, eva_max, eva_min = self.compute_eigenvectors_and_eigenvalues(new_cov)
-                    A_after = (eva_max - eva_min) / (eva_max + eva_min + 1e-6)
-                    A_star = self.cells[c].preferred_anisotropy
-                    E = self.lambda_anisotropy * (A_after - A_star) ** 2
-
-                    if self.lambda_orientation > 0.0:
-                        ustar = self.cells[c].preferred_major_axis.normalized()
-                        align2 = ti.min(1.0, ti.max(-1.0, emax.dot(ustar))) ** 2
-                        E += self.lambda_orientation * (1.0 - align2)
-
-                    total += E
-
-        return total
-
-
     @ti.kernel
     def calc_energy(self):
         """
             Calculate the energy of the potential copies.
             For each selected source pixel, calculate the energy gain of copying it into its target pixel.
-            The energy is calculated as:
-                - Adhesion delta: adhesion of source + adhesion of target - adhesion of target after copy - adhesion of source after copy
-                - Volume delta: Hvol after copy - Hvol before copy
-                - Perimeter delta: H_per after copy - H_per before copy
+            
+            We consider two kinds of energy terms:
+            - Energy-deltas that can be computed locally (i.e. based on the local neighborhood of the source and target pixels)
+            - Bias terms that depends on the cell's properties (e.g. chemotaxis, polarization, etc)
         """
 
         for i, j in self.grid:
             if self.grid[i, j].selected_as_src:
                
                 t_i, t_j = ti.cast(self.grid[i, j].copy_into[0], int), ti.cast(self.grid[i, j].copy_into[1], int)
-                # Adhesion delta is calculated locally by summing adhesion of source and target pixels
-                # After Copy - Before copy
-                adhesion_after = self.calc_adhesion(t_i, t_j, self.grid[i, j].cell_id) + self.calc_adhesion(i, j, self.grid[i, j].cell_id)
-                adhesion_current = self.calc_adhesion(t_i, t_j, self.grid[t_i, t_j].cell_id) + self.calc_adhesion(i, j, self.grid[i, j].cell_id)
-                delta_adhesion = adhesion_after - adhesion_current
-                ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_adhesion)
  
-                # FIXME: Find a solution for this. We cannot iterate over constraints in Taichi
+                # Energy deltas are calculated in the corresponding constraint classes and accumulated in the .copy_energy_delta field
+                # Warning: This means that we cannot add new constraints at runtime, because Taichi needs to compile them statically
                 for cid in ti.static(range(self.n_constraints)):
                     ti.atomic_add(self.grid[i, j].copy_energy_delta, self.constraints[cid].calculate_energy_delta(s_i=i, s_j=j, t_i=t_i, t_j=t_j))
-                  
-                # Polarization Bias:
-                # This is a bias term that encourages cells to copy in the direction of their preferred major axis
-                #polarization_bias_h = self.calc_polarization_bias_h(s_i=i, s_j=j, t_i=t_i, t_j=t_j)
-                #ti.atomic_add(self.grid[i, j].copy_energy_delta, polarization_bias_h)
-
-                # Chemotaxis (bias term):
-                chemotaxis_h = -self.lambda_chemotaxis*(self.chemokine_grid[t_i, t_j] - self.chemokine_grid[i, j]) - self.lambda_repulsion*self.calc_chemotaxis_repulsion_h(s_i=i, s_j=j, t_i=t_i, t_j=t_j)
-                ti.atomic_add(self.grid[i, j].copy_energy_delta, chemotaxis_h)
                 
-                orientation_anisotropy_before = self.cells[self.grid[i, j].cell_id].current_anisotropy_energy + \
-                                                self.cells[self.grid[t_i, t_j].cell_id].current_anisotropy_energy + \
-                                                self.cells[self.grid[i, j].cell_id].current_orientation_energy + \
-                                                self.cells[self.grid[t_i, t_j].cell_id].current_orientation_energy
-                
-
-                orientation_anisotropy_after = self.calc_orientation_anisotropy_h(s_i=i, s_j=j, t_i=t_i, t_j=t_j)
-                delta_orientation_anisotropy = orientation_anisotropy_after - orientation_anisotropy_before
-                ti.atomic_add(self.grid[i, j].copy_energy_delta, delta_orientation_anisotropy)
- 
-                # Avoid invading other cells
-                if self.grid[i, j].cell_id > 0 and self.grid[t_i, t_j].cell_id > 0:
-                    ti.atomic_add(self.grid[i, j].copy_energy_delta, self.lambda_invasion_penalty)
- 
- 
                 # If the cell is selected and either source or target, print debug info
                 #print(f"Selected Cell: {self.grid[i, j].cell_id} ({i}, {j}) -> ({t_i}, {t_j}). {self.cell_selected}")
                 if self.cell_selected[None] > 0 and (self.cell_selected[None] == self.grid[i, j].cell_id or self.cell_selected[None] == self.grid[t_i, t_j].cell_id):
                    print(chr(27) + "[2J")
                    print(f"Cell {self.cell_selected[None]} Selected. Copying from {i}, {j} to {t_i}, {t_j}")
                    print(f"Copy from {i}, {j} ({self.grid[i, j].cell_id}) to {t_i}, {t_j} ({self.grid[t_i, t_j].cell_id})")
-                   print(f"Adhesion Energy (Current/After): {adhesion_current} / {adhesion_after} = {delta_adhesion}")
                    #print(f"Volume Energy (Current/After): {delta_volume_current} / {delta_volume_after} = {delta_volume}")
                    #print(f"Perimeter Energy: {delta_perimeter}")
-                   print(f"Orientation/Anisotropy Energy (Current/After): {orientation_anisotropy_before} / {orientation_anisotropy_after} = {delta_orientation_anisotropy}")
-                   print(f"Chemotaxis Energy: {chemotaxis_h}")
-
-    @ti.func
-    def calc_polarization_bias_h(self, s_i: int, s_j: int, t_i: int, t_j: int) -> float:
-        bias = 0.0  # Default bias
-
-        src_cell_id = self.grid[s_i, s_j].cell_id
-
-        # If source pixel is background (cell_id == 0), bias stays zero
-        if src_cell_id != 0:
-            pref_pol = self.cells[src_cell_id].preferred_major_axis.normalized()
-            copy_dir = ti.Vector([t_i - s_i, t_j - s_j], dt=ti.f32)
-            norm_copy_dir = copy_dir.norm()
-
-            if norm_copy_dir > 1e-6:
-                copy_dir = copy_dir / norm_copy_dir
-                dot = pref_pol.dot(copy_dir)
-                bias = -self.lambda_polarization * dot * self.cells[src_cell_id].current_volume
-
-        return bias
-            
-    @ti.func
-    def calc_chemotaxis_repulsion_h(self, s_i:int, s_j:int, t_i:int, t_j:int) -> float:
-        # Follow chemokine gradient
-        copy_direction = (ti.Vector([t_i, t_j]) - ti.Vector([s_i, s_j])).normalized()
-        
-        desired_direction = ti.Vector([0.0, 0.0])
-        power = 0.0
-
-        source_type = self.cells[self.grid[s_i, s_j].cell_id].cell_type
-        target_type = self.cells[self.grid[t_i, t_j].cell_id].cell_type
-
-        if source_type != target_type:
-            if source_type == 0:
-                # Source is background, energy is governed by target
-                closest_center = ti.Vector([float("inf"), float("inf")])
-                center = self.cells[self.grid[t_i, t_j].cell_id].center
-                for c in range(self.n_cells[None]):
-                    if c > 0 and c != self.grid[t_i, t_j].cell_id:
-                        dist = (self.cells[c].center - center).norm()
-                        if dist < (closest_center - center).norm():
-                            closest_center = self.cells[c].center
-                desired_direction = -(closest_center - center).normalized()
-                power = 1.0
-            else:
-                # Source is a cell, energy is governed by source
-                closest_center = ti.Vector([float("inf"), float("inf")])
-                center = self.cells[self.grid[s_i, s_j].cell_id].center
-                for c in range(self.n_cells[None]):
-                    if c > 0 and c != self.grid[s_i, s_j].cell_id:
-                        dist = (self.cells[c].center - center).norm()
-                        if dist < (closest_center - center).norm():
-                            closest_center = self.cells[c].center
-                desired_direction = -(closest_center - center).normalized()
-                power = 1.0
-        dot = 0.0
-        if desired_direction.norm() > 1e-6:
-            desired_dir_norm = desired_direction.normalized()
-            dot = desired_dir_norm.dot(copy_direction)
-        # Calculate the angle between the desired direction and the copy direction
-        #print(f"Desired Direction: {desired_direction}, Copy Direction: {copy_direction} -> Dot: {dot}")
-        return dot*power
-
-
-    @ti.func
-    def calc_polarization_h(self, s_i: int, s_j: int, t_i:int, t_j: int) -> float:
-        """
-            Calculate the polarization energy of a pixel assuming it is copied from s to t.
-            The energy is calculated as the difference between the preferred polarization and the current polarization
-        """ 
-        
-        t_pos = ti.Vector([float(t_i), float(t_j)])
-        total_energy = 0.0
-        N = int(0)
-        new_N = int(0)
-        gain = int(0)
-
-        # If the source and target are the same, we just compute the current polarization energy
-
-        if s_i == t_i and s_j == t_j:
-            # If source and target are the same, we just compute the current polarization energy
-            for c in range(self.n_cells[None]):
-                if c > 0:
-                    if (c == self.grid[s_i, s_j].cell_id or c == self.grid[t_i, t_j].cell_id):
-                        N = self.cells[c].current_volume
-                        new_N = N
-                        
-                        alignment = abs(self.cells[c].current_polarization.dot(self.cells[c].preferred_polarization))
-
-                        #print(f"Cell {c} New Polarization: {new_polarization_vector}, Preferred: {preferred_polarization}, Alignment: {alignment}")
-                        # TODO: Polarization strength
-                        # TODO: When called with same source and target, should return the current polarization energy
-                        ti.atomic_add(total_energy, self.lambda_polarization * (1 - alignment)**2)
-                        #ti.atomic_add(total_energy, 100*self.lambda_polarization * (1.0 - self.cells[c].current_anisotropy)**2)
-        else:
-             for c in range(self.n_cells[None]):
-                gain = 0
-                new_N = 0
-                # All cells that are not source or target will keep the same polarization so they are not considered
-                if c > 0:
-                    if (c == self.grid[s_i, s_j].cell_id or c == self.grid[t_i, t_j].cell_id):
-                        N = self.cells[c].current_volume
-                        if (c == self.grid[s_i, s_j].cell_id):
-                            # Source is gaining a pixel
-                            gain = int(1)
-                        if (c == self.grid[t_i, t_j].cell_id):
-                            # Target is losing a pixel
-                            gain = int(-1)
-
-                        new_N = self.cells[c].current_volume + gain
-                        # To compute the polarization energy after copy, we need to compute to consider that a gain/loss of pixel changes:
-                        # 1. The center of mass
-                        new_center = ti.Vector([0.0, 0.0])
-                        
-                        if (c == self.grid[s_i, s_j].cell_id):
-                            new_center = (N * self.cells[c].center + t_pos) / new_N
-                        elif (c == self.grid[t_i, t_j].cell_id):
-                            new_center = (N * self.cells[c].center - t_pos) / new_N
-                        
-                        # 2. The covariance matrix
-                        # Instead of recomputing the covariance matrix, we can use the current one and adjust it based on the new center of mass
-                        # I.e., we assume the old pixels are still there, but the new pixel changes the center of mass and the covariance matrix
-                        new_covariance_matrix = (1 / new_N) * (N * self.cells[c].covariance_matrix + gain*(new_center - t_pos).outer_product(new_center - t_pos))
-                        # 3. The polarization vector (longest axis of the covariance matrix)
-                        new_polarization_vector, _, new_anisotropy = self.compute_polarization_and_anisotropy(new_covariance_matrix)
-                        
-                        alignment = abs(new_polarization_vector.dot(self.cells[c].preferred_polarization))
-                        #print(f"Cell {c} New Polarization: {new_polarization_vector}, Preferred: {preferred_polarization}, Alignment: {alignment}")
-                        # TODO: Polarization strength
-                        ti.atomic_add(total_energy, self.lambda_polarization * (1.0 - alignment)**2)
-                        #ti.atomic_add(total_energy, 100*self.lambda_polarization * (1.0 - new_anisotropy)**2)
-
-
-        return total_energy
+                   #print(f"Orientation/Anisotropy Energy (Current/After): {orientation_anisotropy_before} / {orientation_anisotropy_after} = {delta_orientation_anisotropy}")   
 
     def cpm_step(self):
         # Sources and targets are stored into .selected* and .copy_*
@@ -762,36 +508,46 @@ class Simulation():
             self.draw()
 
 
-from config.constraints import PerimeterConstraintConfig, VolumeConstraintConfig
+from config.constraints import PerimeterConstraintConfig, \
+                               VolumeConstraintConfig, \
+                               AdhesionConstraintConfig, \
+                               InvasionPenaltyConstraintConfig, \
+                               ChemotaxisConstraintConfig, \
+                               RepulsionConstraintConfig, \
+                               PolarizationBiasConfig, \
+                               PolarizationConstraintConfig, \
+                               AnisotropyOrientationConstraintConfig
 
 sim_config = {
     "random_seed": 42,
     "size": 512,
     "max_cell_types": 10,
-    "max_cells": 100000,
+    "max_cells": 500,
     "temperature": 1,
     "selection_probability": 1,
-    "lambda_volume": 1e-3,
-    "lambda_perimeter": 1e-3,
-    "lambda_chemotaxis": 50,
-    "lambda_invasion_penalty": 1,
-    "lambda_orientation": 0,
-    "lambda_anisotropy": 0,
-    "lambda_repulsion": 0,
     "mitosis_anisotropy_threshold": 0.7,
-    "mitosis_probability": 0.2,
+    "mitosis_probability": 0.0,
     "chemokine_seed": 0,
     "chemokine_noise_scale": 7,
     "constraints": [
         VolumeConstraintConfig(lambda_weight=1e-3, energy_index=0),
-        PerimeterConstraintConfig(lambda_weight=1e-3, energy_index=1)
+        PerimeterConstraintConfig(lambda_weight=1e-3, energy_index=1),
+        AdhesionConstraintConfig(lambda_weight=1, energy_index=2),
+        InvasionPenaltyConstraintConfig(lambda_weight=1, energy_index=3),
+        ChemotaxisConstraintConfig(lambda_weight=1, energy_index=4),
+        RepulsionConstraintConfig(lambda_weight=0, energy_index=5),
+        #PolarizationBiasConfig(lambda_weight=1, energy_index=6),
+        # AnisotropyOrientationConstraintConfig(lambda_weight=5, 
+        #                                       lambda_anisotropy=1, 
+        #                                       lambda_orientation=1, 
+        #                                       energy_index=6)
     ],
     "cell_types": [
         {
             "j_adhesion_stroma": 0.0,
-            "j_adhesion_other": .0,
+            "j_adhesion_other": 5.0,
             "preferred_volume_stats": [0.005, 0.0001],
-            "preferred_anisotropy_stats": [0.9, 0.001],
+            "preferred_anisotropy_stats": [0.8, 0.001],
             "preferred_orientation_stats": [[1.0, 0.1], [0.0, 0.1]],
             "mitosis_age_stats": [60*10, 50]
         }

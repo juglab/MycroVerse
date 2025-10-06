@@ -2,7 +2,7 @@ import taichi as ti
 import math
 
 # This defines the maximum number of energy terms we will track per cell, due to a taichi limitation
-MAX_ENERGY_TERMS = 10
+MAX_ENERGY_TERMS = 100
 
 @ti.dataclass
 class CellType():
@@ -41,7 +41,6 @@ class Cell():
 
     # Current energy terms (pre-computed for performance)
     current_energy_terms: ti.types.vector(MAX_ENERGY_TERMS, float) # Array to hold different energy terms. Indices are defined by the order of constraints in the simulation
-    current_ellipse_energy: float # Current ellipse energy for the cell
     current_orientation_energy: float # Current orientation energy for the cell
     current_anisotropy_energy: float # Current anisotropy energy for the cell
 
