@@ -1,18 +1,10 @@
 import taichi as ti
+import numpy as np
 import math
 
 # This defines the maximum number of energy terms we will track per cell, due to a taichi limitation
 MAX_ENERGY_TERMS = 100
 
-@ti.dataclass
-class CellType():
-    j_adhesion_stroma: float
-    j_adhesion_other: float
-    preferred_volume_stats: ti.math.vec2 # mean and std for preferred volume
-    preferred_anisotropy_stats: ti.math.vec2 # mean and std for preferred anisotropy
-    preferred_orientation_stats: ti.math.mat2 # mean and std for preferred orientation (2D vector)
-    mitosis_age_stats: ti.math.vec2 # mean and std for mitosis age
-    
 @ti.dataclass
 class Cell():
     # Identifiers
@@ -45,13 +37,31 @@ class Cell():
     current_anisotropy_energy: float # Current anisotropy energy for the cell
 
     # Mitosis Probabilities
-    mitosis_prob_volume: float
-    mitosis_prob_age: float
     mitosis_age_threshold: float
+    mitosis_probability: float 
 
     # Behavioral parameters
     should_split: int # Flag to indicate if the cell should split (1) or not (0) in the next step
     
+    @ti.func
+    def zero_current_parameters(self):
+        """
+            Set all current parameters to zero. Used for re-initialization at each simulation step.
+        """
+        self.current_volume = 0.0
+        self.current_perimeter = 0.0
+        self.current_anisotropy = 0.0
+        self.center = ti.math.vec2(0.0, 0.0)
+        self.maj_axis = ti.math.vec2(0.0, 0.0)
+        self.min_axis = ti.math.vec2(0.0, 0.0)
+        self.max_eigenvalue = 0.0
+        self.min_eigenvalue = 0.0
+        self.covariance_matrix = ti.math.mat2(0.0, 0.0, 0.0, 0.0)
+        self.current_orientation_energy = 0.0
+        self.current_anisotropy_energy = 0.0
+        self.mitosis_probability = 0.0
+        self.should_split = 0
+
     def print_debug(self):
         print(f" Cell {self.cell_id}: Type {self.cell_type}")
         print(f"  Age (current / mitosis thr.): {self.current_age} / {self.mitosis_age_threshold}")
@@ -65,13 +75,11 @@ class Cell():
         print(f"  Should Split: {self.should_split}")
         print(f"  Covariance Matrix: {self.covariance_matrix}")
         print(f"  Anisotropy: {self.current_anisotropy}")
-        print(f"  Current Energy: {self.current_volume_energy + self.current_perimeter_energy + self.current_anisotropy_energy + self.current_orientation_energy}")
-        print(f"  Current Volume Energy: {self.current_volume_energy}")
-        print(f"  Current Perimeter Energy: {self.current_perimeter_energy}")
+        print(f"  Current Energy Terms: {self.current_energy_terms}")
         print(f"  Current Anisotropy Energy: {self.current_anisotropy_energy}")
         print(f"  Current Orientation Energy: {self.current_orientation_energy}")
-        print(f"  Mitosis Probabilities: Age {self.mitosis_prob_age}, Volume {self.mitosis_prob_volume}")
-
+        print(f"  Mitosis Probability: {self.mitosis_probability}")
+        
 @ti.dataclass
 class CellPoint():
     cell_id: int
@@ -83,3 +91,34 @@ class CellPoint():
     copy_into: ti.math.vec2
     copy_from: ti.math.vec2
     copy_energy_delta: float
+
+@ti.dataclass
+class CellType():
+    id: int
+    j_adhesion_stroma: float
+    j_adhesion_other: float
+    preferred_volume_stats: ti.math.vec2 # mean and std for preferred volume
+    preferred_anisotropy_stats: ti.math.vec2 # mean and std for preferred anisotropy
+    preferred_orientation_stats: ti.math.mat2 # mean and std for preferred orientation (2D vector)
+    mitosis_age_stats: ti.math.vec2 # mean and std for mitosis age
+
+
+    def sample_cell(self, cell_ptr: Cell, sim) -> None:
+        """
+            Sample a new cell of this type with preferred parameters drawn from the defined statistics.
+            Cell ID MUST be set externally.
+            Note: This function only initializes preferred parameters. Current parameters are set to zero.
+        """
+        cell_ptr.cell_type = self.id
+        cell_ptr.preferred_volume = np.clip(sim.random.normal(loc=self.preferred_volume_stats[0],
+                                                             scale=self.preferred_volume_stats[1]), 
+                                                             a_min=0., 
+                                                             a_max=1) * sim.size * sim.size  # Scale volume to the grid size
+        cell_ptr.preferred_major_axis = ti.Vector(arr=[sim.random.normal(loc=self.preferred_orientation_stats[0, 0],
+                                                                         scale=self.preferred_orientation_stats[1, 0]),
+                                                        sim.random.normal(loc=self.preferred_orientation_stats[0, 1],
+                                                                         scale=self.preferred_orientation_stats[1, 1])]).normalized()
+        cell_ptr.preferred_anisotropy = sim.random.normal(loc=self.preferred_anisotropy_stats[0],
+                                                           scale=self.preferred_anisotropy_stats[1])
+        cell_ptr.mitosis_age_threshold = sim.random.normal(loc=self.mitosis_age_stats[0],
+                                                              scale=self.mitosis_age_stats[1])

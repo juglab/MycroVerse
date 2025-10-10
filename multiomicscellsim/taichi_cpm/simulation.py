@@ -3,10 +3,12 @@ import math
 import numpy as np
 from perlin_numpy import generate_perlin_noise_2d
 from typing import List
-from entities import Cell, CellPoint, CellType, MAX_ENERGY_TERMS
+from entities import Cell, CellPoint, CellType
 from utils import point_in_polygon, get_polygon_edges, local_perimeter, compute_eigenvectors_and_eigenvalues
-from config.constraints import constraint_factory
-
+from multiomicscellsim.taichi_cpm.config.constraints import constraint_factory
+from multiomicscellsim.taichi_cpm.config.cell_types import celltype_factory
+from multiomicscellsim.taichi_cpm.config.static import MAX_ENERGY_TERMS
+from multiomicscellsim.taichi_cpm.config.behaviours import behaviour_factory
 
 @ti.data_oriented
 class Simulation():
@@ -21,26 +23,22 @@ class Simulation():
         # Simulation parameters
         self.size = sim_config["size"]
         self.max_cells=sim_config["max_cells"]
-        self.max_cell_types = sim_config["max_cell_types"]
         self.temperature = sim_config["temperature"]
         self.select_prob = ti.field(dtype=float, shape=())
         self.select_prob[None] = sim_config.get("selection_probability", 0.5) # Probability of selecting a cell for copying
 
         # Define constraints
         assert len(sim_config["constraints"]) <= MAX_ENERGY_TERMS, f"Number of constraints exceeds MAX_ENERGY_TERMS ({MAX_ENERGY_TERMS})"
-        self.constraints = []
-        self.constraints_names = []
         
+        self.constraints = []        
         for constraint_config in sim_config["constraints"]:
             new_constraint = constraint_factory(constraint_config, self)
             self.constraints.append(new_constraint)
-            self.constraints_names.append(new_constraint.energy_term_name)
 
         self.n_constraints = len(self.constraints)
 
-        # Behavioral parameters
-        self.mitosis_probability = sim_config.get("mitosis_probability", 1.0)
-        self.mitosis_anisotropy_threshold = sim_config.get("mitosis_anisotropy_threshold", 0.5)
+        
+        
 
         # Chemicals parameters
         self.chemokine_seed = sim_config.get("chemokine_seed", 0)
@@ -54,20 +52,45 @@ class Simulation():
         self.gui = ti.GUI(name="MycroVerse", res=self.size)
         self.render_grid = ti.field(dtype=float, shape=(self.size, self.size, 3))
         
-        self.build_celltype_list()
+        
+        # Field mapping behaviours (index in self.behaviours) to cell types id.
+        # Initialized in setup_celltypes_and_behaviours
+        self.behaviour_to_celltype = None
+        self.setup_celltypes_and_behaviours()
+        
+
+        print(self.behaviours)
         self.reinit()
 
-    def build_celltype_list(self):
-        self.cell_types = CellType.field(shape=(len(self.config["cell_types"])+1,))
+    def setup_celltypes_and_behaviours(self):
+        """
+            Populate the cell_types field with the configured cell types.
+        """
 
-        for c, ct in enumerate(self.config["cell_types"]):
-            # Leave slot 0 for background
-            self.cell_types[c+1].j_adhesion_stroma = ct["j_adhesion_stroma"]
-            self.cell_types[c+1].j_adhesion_other = ct["j_adhesion_other"]
-            self.cell_types[c+1].preferred_volume_stats = ti.Vector(arr=ct["preferred_volume_stats"])
-            self.cell_types[c+1].preferred_anisotropy_stats = ti.Vector(arr=ct.get("preferred_anisotropy_stats", [0.0, 0.0]))
-            self.cell_types[c+1].preferred_orientation_stats = ti.Vector(arr=ct.get("preferred_orientation_stats", [[0.0, 0.0], [0.0, 0.0]]))
-            self.cell_types[c+1].mitosis_age_stats = ti.Vector(arr=ct.get("mitosis_age_stats", [100.0, 10]))
+        n_celltypes = len(self.config["cell_types"])
+
+        self.behaviours = []
+        behaviours_configs = []
+    
+        # We reserve slot 0 for the background to support stroma properties
+        self.cell_types = CellType.field(shape=(n_celltypes+1,))
+        for c, ct_cfg in enumerate(self.config["cell_types"]):
+
+            celltype_factory(c+1, self.cell_types[c+1], ct_cfg)
+            # Maintains a list of behaviours for each cell type 
+            # (we cannot embed them in CellType because Taichi does not support dynamic lists and classes in dataclasses)
+            ct_behaviours = ct_cfg.behaviours
+            behaviours_configs.append(ct_behaviours)
+
+        # Convert to Taichi fields
+        self.n_behaviours = sum(len(bh_cfgs) for bh_cfgs in behaviours_configs)
+        self.behaviour_to_celltype = ti.field(dtype=int, shape=(self.n_behaviours,))
+        for ct_idx, bh_cfgs in enumerate(behaviours_configs):
+            for bh_cfg in bh_cfgs:
+                # Create behaviour instance
+                behaviour = behaviour_factory(bh_cfg, self)
+                self.behaviours.append(behaviour)
+                self.behaviour_to_celltype[len(self.behaviours)-1] = ct_idx + 1 # +1 because 0 is the background
 
     def reinit(self):
         self.grid = CellPoint.field(shape=(self.size, self.size))
@@ -78,7 +101,13 @@ class Simulation():
         self.chemokine_setup()
 
         # TODO: Stochastic cell generation
-        self.create_cell(.5, .5, 1)
+        n_celltypes = len(self.config["cell_types"])
+        # Place cells on a grid 
+        for ct_idx in range(1, n_celltypes + 1):
+            print(f"Creating initial cell of type {ct_idx}")
+            x_c = self.random.uniform(0.2, 0.8)
+            y_c = self.random.uniform(0.2, 0.8)
+            self.create_cell(x_c, y_c, ct_idx)
         # Recalc all params before starting simulation
         self.update_grid_params()
     
@@ -98,7 +127,6 @@ class Simulation():
         # Restore original global RNG state
         np.random.set_state(state)
 
-
     @ti.kernel
     def draw_polygon_on_grid(self, polygon:ti.template(), cell_id:int, cell_type:int): # type: ignore
         for i, j in self.grid:
@@ -107,26 +135,23 @@ class Simulation():
                 self.grid[i,j].cell_type = cell_type
 
     def create_cell(self, xc: float, yc: float, cell_type:int):
+        """
+            Create a new cell at the given normalized coordinates (0-1) with the specified cell type.
+            The cell ID is automatically assigned.
+            The cell is drawn as a circle with a fixed radius.
+            Args:
+                xc (float): Normalized x-coordinate (0-1) for the cell center.
+                yc (float): Normalized y-coordinate (0-1) for the cell center.
+                cell_type (int): The type of the cell to be created.
+        """
+
         # Sample params from stats
-        mu_vol, std_vol = self.cell_types[cell_type].preferred_volume_stats
         cell_id = self.n_cells[None]
         self.n_cells[None] += 1
-        self.cells[cell_id].cell_type = cell_type
-        self.cells[cell_id].preferred_volume = np.clip(self.random.normal(loc=mu_vol, scale=std_vol), .0001, 1) * self.size * self.size
-        self.cells[cell_id].preferred_major_axis = ti.Vector(arr=[self.random.normal(loc=self.cell_types[cell_type].preferred_orientation_stats[0, 0],
-                                                                                     scale=self.cell_types[cell_type].preferred_orientation_stats[1, 0]),
-                                                                  self.random.normal(loc=self.cell_types[cell_type].preferred_orientation_stats[0, 1],
-                                                                                     scale=self.cell_types[cell_type].preferred_orientation_stats[1, 1])]).normalized()
-
-        self.cells[cell_id].preferred_anisotropy = self.random.normal(loc=self.cell_types[cell_type].preferred_anisotropy_stats[0],
-                                                                                 scale=self.cell_types[cell_type].preferred_anisotropy_stats[1])
-        self.cells[cell_id].mitosis_age_threshold = self.random.normal(loc=self.cell_types[cell_type].mitosis_age_stats[0],
-                                                                       scale=self.cell_types[cell_type].mitosis_age_stats[1])
-        print(f"Creating cell {cell_id} of type {cell_type} with preferred volume {self.cells[cell_id].preferred_volume}, \
-                orientation {self.cells[cell_id].preferred_major_axis}, \
-                anisotropy {self.cells[cell_id].preferred_anisotropy}, \
-                mitosis age threshold {self.cells[cell_id].mitosis_age_threshold}")
-        
+        self.cells[cell_id].cell_id = cell_id
+        # Set Cell parameters according to the cell type
+        self.cell_types[cell_type].sample_cell(self.cells[cell_id], self)
+        # Draw a circular cell
         radius = 0.02
         n_edges = 16
         verts = ti.Vector.field(n=2, dtype=int, shape=(n_edges,))
@@ -163,14 +188,7 @@ class Simulation():
         # Reset all cell parameters
         for c in self.cells:
             if self.cells[c].cell_type > 0:
-                self.cells[c].current_perimeter = 0.0
-                self.cells[c].current_volume = 0.0
-                self.cells[c].center = ti.Vector([0.0, 0.0])
-                self.cells[c].covariance_matrix = ti.Matrix([[0.0, 0.0], [0.0, 0.0]])
-                self.cells[c].current_anisotropy = 0.0
-                self.cells[c].maj_axis = ti.Vector([0.0, 0.0])
-                self.cells[c].min_axis = ti.Vector([0.0, 0.0])
-
+                self.cells[c].zero_current_parameters()
 
         # Accumulate grid parameters (operations on pixels)
         for i, j in self.grid:
@@ -202,8 +220,7 @@ class Simulation():
                 # Using outer product to accumulate covariance
                 ti.atomic_add(self.cells[self.grid[i, j].cell_id].covariance_matrix, ti.Matrix([[diff.x * diff.x, diff.x * diff.y],
                                                                                             [diff.x * diff.y, diff.y * diff.y]]))
-        
-
+                
         for c in self.cells:
             if self.cells[c].current_volume > 0:
                 # Normalize covariance matrix
@@ -213,30 +230,16 @@ class Simulation():
                 self.cells[c].current_anisotropy = (self.cells[c].max_eigenvalue - self.cells[c].min_eigenvalue) / (self.cells[c].max_eigenvalue + self.cells[c].min_eigenvalue + 1e-6)
 
             # Update behavior
+            for behav_id in ti.static(range(self.n_behaviours)):
+                if self.behaviour_to_celltype[behav_id] == self.cells[c].cell_type:
+                    self.behaviours[behav_id].on_behaviour_update(cell_id=c) # FIXME: pass the step number?
+                    #print(f"Updated Cell {self.cells[c].cell_id} - Preferred Perimeter: {self.cells[c].preferred_perimeter}, Current Perimeter: {self.cells[c].current_perimeter}")
+
             if c > 0 and self.cells[c].cell_type > 0:
-                # Try to approximate an ellipse
-                # TODO: If more shape are implemented, this should be generalized
-
-                a = ti.sqrt(self.cells[c].max_eigenvalue)
-                b = ti.sqrt(self.cells[c].min_eigenvalue)
-
-                scaling_factor = ti.sqrt(self.cells[c].current_volume / (ti.math.pi * a * b))
-                a *= scaling_factor
-                b *= scaling_factor
-
-                # Step 3: Ramanujan's perimeter approximation
-                h = ((a - b)**2) / ((a + b)**2)
-                self.cells[c].preferred_perimeter = 3 * ti.math.pi * (a + b) * (1 + (3 * h) / (10 + ti.sqrt(4 - 3 * h)))
 
                 # Recompute energy terms
                 for cid in ti.static(range(self.n_constraints)):
                     self.cells[c].current_energy_terms[self.constraints[cid].energy_index] = self.constraints[cid].calculate_current_cell_energy(c)
-
-
-                # Compute mitosis probabilities
-                k = 0.01 # Slope of sigmoid
-                self.cells[c].mitosis_prob_volume = (1.0 / (1.0 + ti.exp(-k * (self.cells[c].current_volume - self.cells[c].preferred_volume))))
-                self.cells[c].mitosis_prob_age = (1.0 / (1.0 + ti.exp(-k * (self.cells[c].current_age - self.cells[c].mitosis_age_threshold))))
 
 
     @ti.kernel
@@ -372,10 +375,7 @@ class Simulation():
                    print(chr(27) + "[2J")
                    print(f"Cell {self.cell_selected[None]} Selected. Copying from {i}, {j} to {t_i}, {t_j}")
                    print(f"Copy from {i}, {j} ({self.grid[i, j].cell_id}) to {t_i}, {t_j} ({self.grid[t_i, t_j].cell_id})")
-                   #print(f"Volume Energy (Current/After): {delta_volume_current} / {delta_volume_after} = {delta_volume}")
-                   #print(f"Perimeter Energy: {delta_perimeter}")
-                   #print(f"Orientation/Anisotropy Energy (Current/After): {orientation_anisotropy_before} / {orientation_anisotropy_after} = {delta_orientation_anisotropy}")   
-
+                   
     def cpm_step(self):
         # Sources and targets are stored into .selected* and .copy_*
         self.select_potential_copies()
@@ -392,11 +392,10 @@ class Simulation():
             Check if any cell should split based on its current volume.
             If the current volume is greater than the preferred volume, mark it for splitting.
         """
+        # TODO: Move this into a behaviour
         for c in self.cells:
             if self.cells[c].cell_type >= 1:
-               
-                #print(f"Vol Prob for cell {c}: {vol_prob} (Current Volume: {v}, Preferred Volume: {v0})")
-                if ti.random() < self.mitosis_probability * self.cells[c].mitosis_prob_volume * self.cells[c].mitosis_prob_age:
+                if ti.random() < self.cells[c].mitosis_probability:
                     self.cells[c].should_split = 1
 
     @ti.kernel
@@ -439,8 +438,7 @@ class Simulation():
                         self.render_grid[i, j, 1] = self.grid[i, j].local_perimeter / 8
                         self.render_grid[i, j, 2] = 0.0
                     if mode == 1:
-                        self.render_grid[i, j, 0] = self.cells[self.grid[i, j].cell_id].mitosis_prob_volume
-                        self.render_grid[i, j, 1] = self.cells[self.grid[i, j].cell_id].mitosis_prob_age
+                        self.render_grid[i, j, 0] = self.cells[self.grid[i, j].cell_id].mitosis_probability * 10.0
                         self.render_grid[i, j, 2] = 0.0
                 else:
                     # Display chemokine
@@ -508,7 +506,7 @@ class Simulation():
             self.draw()
 
 
-from config.constraints import PerimeterConstraintConfig, \
+from multiomicscellsim.taichi_cpm.config.constraints import PerimeterConstraintConfig, \
                                VolumeConstraintConfig, \
                                AdhesionConstraintConfig, \
                                InvasionPenaltyConstraintConfig, \
@@ -518,6 +516,12 @@ from config.constraints import PerimeterConstraintConfig, \
                                PolarizationConstraintConfig, \
                                AnisotropyOrientationConstraintConfig
 
+from multiomicscellsim.taichi_cpm.config.cell_types import CellTypeConfig
+from multiomicscellsim.taichi_cpm.config.behaviours import EllipticPerimeterConfig, \
+                                MitosisAgeVolumeBehaviourConfig
+
+
+
 sim_config = {
     "random_seed": 42,
     "size": 512,
@@ -525,16 +529,14 @@ sim_config = {
     "max_cells": 500,
     "temperature": 1,
     "selection_probability": 1,
-    "mitosis_anisotropy_threshold": 0.7,
-    "mitosis_probability": 0.0,
     "chemokine_seed": 0,
-    "chemokine_noise_scale": 7,
+    "chemokine_noise_scale": 5,
     "constraints": [
         VolumeConstraintConfig(lambda_weight=1e-3, energy_index=0),
         PerimeterConstraintConfig(lambda_weight=1e-3, energy_index=1),
         AdhesionConstraintConfig(lambda_weight=1, energy_index=2),
         InvasionPenaltyConstraintConfig(lambda_weight=1, energy_index=3),
-        ChemotaxisConstraintConfig(lambda_weight=1, energy_index=4),
+        ChemotaxisConstraintConfig(lambda_weight=50, energy_index=4),
         RepulsionConstraintConfig(lambda_weight=0, energy_index=5),
         #PolarizationBiasConfig(lambda_weight=1, energy_index=6),
         # AnisotropyOrientationConstraintConfig(lambda_weight=5, 
@@ -543,16 +545,58 @@ sim_config = {
         #                                       energy_index=6)
     ],
     "cell_types": [
-        {
-            "j_adhesion_stroma": 0.0,
-            "j_adhesion_other": 5.0,
-            "preferred_volume_stats": [0.005, 0.0001],
-            "preferred_anisotropy_stats": [0.8, 0.001],
-            "preferred_orientation_stats": [[1.0, 0.1], [0.0, 0.1]],
-            "mitosis_age_stats": [60*10, 50]
-        }
+        CellTypeConfig( 
+            name="Type 1",
+            j_adhesion_stroma=0.0,
+            j_adhesion_other=4.0,
+            preferred_volume_stats=[0.005, 0.0001],
+            preferred_anisotropy_stats=[0.8, 0.001],
+            preferred_orientation_stats=[[1.0, 0.1], [0.0, 0.1]],
+            mitosis_age_stats=[10*10, 50],
+            behaviours=[
+                            EllipticPerimeterConfig(dynamics=None),
+                            MitosisAgeVolumeBehaviourConfig(dynamics=None, 
+                                                            sigmoid_slope=0.01, 
+                                                            probability_scale=0.1
+                                                            )
+                       ]
+        ),
+        CellTypeConfig(
+            name="Type 2",
+            j_adhesion_stroma=0.0,
+            j_adhesion_other=4.0,
+            preferred_volume_stats=[0.001, 0.0001],
+            preferred_anisotropy_stats=[0.8, 0.001],
+            preferred_orientation_stats=[[1.0, 0.1], [0.0, 0.1]],
+            mitosis_age_stats=[60*10, 50],
+            behaviours=[
+                            EllipticPerimeterConfig(dynamics=None),
+                            MitosisAgeVolumeBehaviourConfig(dynamics=None, 
+                                                            sigmoid_slope=0.01, 
+                                                            probability_scale=0.1,
+                                                            )
+                       ]
+        ),
+        CellTypeConfig(
+            name="Type 3",
+            j_adhesion_stroma=0.0,
+            j_adhesion_other=4.0,
+            preferred_volume_stats=[0.01, 0.0001],
+            preferred_anisotropy_stats=[0.2, 0.001],
+            preferred_orientation_stats=[[1.0, 0.1], [0.0, 0.1]],
+            mitosis_age_stats=[60*10, 50],
+            behaviours=[
+                            EllipticPerimeterConfig(dynamics=None),
+                            MitosisAgeVolumeBehaviourConfig(dynamics=None, 
+                                                            sigmoid_slope=0.01, 
+                                                            probability_scale=0.1,
+                                                            )
+                       ]
+        ),
     ]
 }
+
+
 
 sim = Simulation(sim_config)
 sim.run()

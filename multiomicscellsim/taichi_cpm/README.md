@@ -27,4 +27,4 @@ This package contains a Taichi-based implementation of the Cellular Potts Model 
 1. Create a new file in the `constraints` folder, e.g. `my_constraint.py`.
 2. Derive a new class from `BaseConstraint` and implement the required methods.
 3. Create a corresponding configuration dataclass in `config/constraints.py` and add to the `constraint_factory` method.
-4. Add the new constraint to the `sim_config` 
+4. Add the new constraint to the `sim_config` incrementing the `energy_index`.
