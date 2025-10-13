@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import List
 from multiomicscellsim.taichi_cpm.config.dynamics import BaseParameterDynamicsConfig, dynamics_factory
-from multiomicscellsim.taichi_cpm.behaviours import BaseBehaviour, EllipticPerimeter, MitosisAgeVolumeCopyBehaviour, AdhesionBehaviour
+from multiomicscellsim.taichi_cpm.behaviours import BaseBehaviour, EllipticPerimeter, MitosisAgeVolumeCopyBehaviour, AdhesionBehaviour, VolumeBehaviour
 
 
 class BaseBehaviourConfig(BaseModel):
@@ -14,6 +14,10 @@ class AdhesionBehaviourConfig(BaseBehaviourConfig):
     influences: List[str] = ["j_adhesion_other", "j_adhesion_stroma"]
     j_adhesion_stroma: float = Field(0.0, description="Initial adhesion energy with the stroma")
     j_adhesion_other: float = Field(4.0, description="Initial adhesion energy with other cells")
+
+class VolumeBehaviourConfig(BaseBehaviourConfig):
+    name: str = "volume"
+    influences: List[str] = ["preferred_volume"]
 
 class EllipticPerimeterBehaviourConfig(BaseBehaviourConfig):
     name: str = "approximate_ellipse"
@@ -36,7 +40,7 @@ def behaviour_factory(config: BaseBehaviourConfig, sim, *args, **kwargs) -> Base
             config (BaseBehaviourConfig): The configuration for the Behaviour.
             sim: The simulation instance.
     """
-    dynamics = dynamics_factory(config.dynamics, sim, *args, **kwargs)
+    dynamics = dynamics_factory(config.dynamics, sim, *args, **kwargs) if config.dynamics is not None else None
    
     if isinstance(config, EllipticPerimeterBehaviourConfig):
         return EllipticPerimeter(sim, dynamics)
@@ -44,6 +48,8 @@ def behaviour_factory(config: BaseBehaviourConfig, sim, *args, **kwargs) -> Base
         return MitosisAgeVolumeCopyBehaviour(sim, dynamics, config.sigmoid_slope, config.probability_scale)
     elif isinstance(config, AdhesionBehaviourConfig):
         return AdhesionBehaviour(sim, dynamics, config.j_adhesion_stroma, config.j_adhesion_other)
+    elif isinstance(config, VolumeBehaviourConfig):
+        return VolumeBehaviour(sim, dynamics)
     else:
         print(f"Unknown behaviour config type: {type(config)} {config}")
         raise ValueError(f"Unknown behaviour config type: {type(config)}")

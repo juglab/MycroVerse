@@ -2,7 +2,7 @@
 import taichi as ti
 from typing import List
 from abc import ABC, abstractmethod
-from multiomicscellsim.taichi_cpm.dynamics import BaseParameterDynamics
+from multiomicscellsim.taichi_cpm.dynamics import BaseParameterDynamics, ConstantParameterDynamics
 from multiomicscellsim.taichi_cpm.entities import Cell, CellType
 
 @ti.data_oriented
@@ -18,7 +18,8 @@ class BaseBehaviour(ABC):
 
     def __init__(self, sim, dynamics: BaseParameterDynamics):
         self.sim = sim
-        self.dynamics = dynamics
+        ## If no dynamics is provided, use a constant dynamics as fallback (to avoid "is None" checks in Taichi kernels)
+        self.dynamics = dynamics if dynamics is not None else ConstantParameterDynamics()
 
     def on_new_cell(self, cell_id: int):
         """
@@ -50,6 +51,7 @@ class AdhesionBehaviour(BaseBehaviour):
     """
         A behaviour that makes a cell adjust its adhesion properties over time.
     """
+    name: str = "adhesion"
     influences: List[str] = ["j_adhesion_other", "j_adhesion_stroma"]
 
     def __init__(self, sim, dynamics: BaseParameterDynamics, j_adhesion_stroma: float = 0.0, j_adhesion_other: float = 4.0):
@@ -70,8 +72,6 @@ class AdhesionBehaviour(BaseBehaviour):
     def on_behaviour_update(self, cell_id: int):
         # Preferred adhesion are constant for now
         pass
-        
-
 
 class VolumeBehaviour(BaseBehaviour):
     """
@@ -85,6 +85,9 @@ class VolumeBehaviour(BaseBehaviour):
     @ti.func
     def on_behaviour_update(self, cell_id: int):
         cell = self.sim.cells[cell_id]
+        if cell.cell_id > 0 and cell.cell_type > 0:
+            new_volume = self.dynamics.on_parameter_update(cell_id, self.sim, cell.preferred_volume, cell.current_age)
+            self.sim.cells[cell_id].preferred_volume = new_volume
 
     
 class EllipticPerimeter(BaseBehaviour):
