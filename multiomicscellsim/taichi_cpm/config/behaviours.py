@@ -1,15 +1,21 @@
 from pydantic import BaseModel, Field
 from typing import List
 from multiomicscellsim.taichi_cpm.config.dynamics import BaseParameterDynamicsConfig, dynamics_factory
-from multiomicscellsim.taichi_cpm.behaviours import BaseBehaviour, EllipticPerimeter, MitosisAgeVolumeCopyBehaviour
+from multiomicscellsim.taichi_cpm.behaviours import BaseBehaviour, EllipticPerimeter, MitosisAgeVolumeCopyBehaviour, AdhesionBehaviour
 
 
 class BaseBehaviourConfig(BaseModel):
     name: str = Field(description="Description name of the behaviour")
     influences: List[str]
-    dynamics: BaseParameterDynamicsConfig | None = Field(description="Configuration for the dynamics of the behaviour")
+    dynamics: BaseParameterDynamicsConfig | None = Field(description="Configuration for the dynamics of the behaviour", default=None)
 
-class EllipticPerimeterConfig(BaseBehaviourConfig):
+class AdhesionBehaviourConfig(BaseBehaviourConfig):
+    name: str = "adhesion"
+    influences: List[str] = ["j_adhesion_other", "j_adhesion_stroma"]
+    j_adhesion_stroma: float = Field(0.0, description="Initial adhesion energy with the stroma")
+    j_adhesion_other: float = Field(4.0, description="Initial adhesion energy with other cells")
+
+class EllipticPerimeterBehaviourConfig(BaseBehaviourConfig):
     name: str = "approximate_ellipse"
     influences: List[str] = ["preferred_perimeter"]
 
@@ -32,10 +38,12 @@ def behaviour_factory(config: BaseBehaviourConfig, sim, *args, **kwargs) -> Base
     """
     dynamics = dynamics_factory(config.dynamics, sim, *args, **kwargs)
    
-    if isinstance(config, EllipticPerimeterConfig):
+    if isinstance(config, EllipticPerimeterBehaviourConfig):
         return EllipticPerimeter(sim, dynamics)
     elif isinstance(config, MitosisAgeVolumeBehaviourConfig):
         return MitosisAgeVolumeCopyBehaviour(sim, dynamics, config.sigmoid_slope, config.probability_scale)
+    elif isinstance(config, AdhesionBehaviourConfig):
+        return AdhesionBehaviour(sim, dynamics, config.j_adhesion_stroma, config.j_adhesion_other)
     else:
         print(f"Unknown behaviour config type: {type(config)} {config}")
         raise ValueError(f"Unknown behaviour config type: {type(config)}")

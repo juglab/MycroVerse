@@ -18,6 +18,10 @@ class Cell():
     preferred_anisotropy: float # Preferred anisotropy value for the cell (How much the cell is elongated)
     preferred_major_axis: ti.math.vec2 # Preferred major axis (orientation) of the cell's shape
 
+    # Preferred adhesion parameters
+    j_adhesion_stroma: float # Penalty coefficient for adhesion energy towards the stroma
+    j_adhesion_other: float # Penalty coefficient for adhesion towards other cells
+
     # Current parameters
     current_volume: float
     current_perimeter: float
@@ -95,8 +99,6 @@ class CellPoint():
 @ti.dataclass
 class CellType():
     id: int
-    j_adhesion_stroma: float
-    j_adhesion_other: float
     preferred_volume_stats: ti.math.vec2 # mean and std for preferred volume
     preferred_anisotropy_stats: ti.math.vec2 # mean and std for preferred anisotropy
     preferred_orientation_stats: ti.math.mat2 # mean and std for preferred orientation (2D vector)

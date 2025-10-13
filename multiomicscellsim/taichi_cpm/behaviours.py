@@ -20,6 +20,15 @@ class BaseBehaviour(ABC):
         self.sim = sim
         self.dynamics = dynamics
 
+    def on_new_cell(self, cell_id: int):
+        """
+            Action to be performed when a new cell is created.
+            This function is called OUTSIDE a Taichi kernel, so it can use normal Python code.
+            Any change to the cell parameters MUST be done through the sim.cells[cell_id]
+        """
+        pass
+
+    @ti.func
     def on_behaviour_update(self, cell_id: int):
         """
             Action to be performed at each behaviour update step.
@@ -28,6 +37,7 @@ class BaseBehaviour(ABC):
         """
         pass
 
+    @ti.func
     def on_mitosis(self, mother_id: int, daughter_id: int):
         """
             Action to be performed when a cell divides.
@@ -35,6 +45,33 @@ class BaseBehaviour(ABC):
             Any change to the cell parameters MUST be done through the sim.cells[cell_id]
         """
         pass
+
+class AdhesionBehaviour(BaseBehaviour):
+    """
+        A behaviour that makes a cell adjust its adhesion properties over time.
+    """
+    influences: List[str] = ["j_adhesion_other", "j_adhesion_stroma"]
+
+    def __init__(self, sim, dynamics: BaseParameterDynamics, j_adhesion_stroma: float = 0.0, j_adhesion_other: float = 4.0):
+        super().__init__(sim, dynamics)
+        self.j_adhesion_stroma = j_adhesion_stroma
+        self.j_adhesion_other = j_adhesion_other
+
+    def on_new_cell(self, cell_id: int):
+        """
+            Initialize the adhesion parameters of the new cell. (Fixed values)
+        """
+        cell = self.sim.cells[cell_id]
+        if cell.cell_id > 0 and cell.cell_type > 0:
+            self.sim.cell_types[cell.cell_type].j_adhesion_stroma = self.j_adhesion_stroma
+            self.sim.cell_types[cell.cell_type].j_adhesion_other = self.j_adhesion_other
+
+    @ti.func
+    def on_behaviour_update(self, cell_id: int):
+        # Preferred adhesion are constant for now
+        pass
+        
+
 
 class VolumeBehaviour(BaseBehaviour):
     """
@@ -111,7 +148,7 @@ class MitosisAgeVolumeCopyBehaviour(BaseBehaviour):
 
     @ti.func
     def on_mitosis(self, mother_id: int, daughter_id: int):
-        print(f"Mitosis: Mother {mother_id} -> Daughter {daughter_id}")
+        # Copy preferred parameters from mother to daughter
         self.sim.cells[daughter_id].cell_type = self.sim.cells[mother_id].cell_type
         self.sim.cells[daughter_id].preferred_volume = self.sim.cells[mother_id].preferred_volume
         self.sim.cells[daughter_id].preferred_perimeter = self.sim.cells[mother_id].preferred_perimeter

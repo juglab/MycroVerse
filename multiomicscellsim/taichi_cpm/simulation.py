@@ -8,7 +8,7 @@ from utils import point_in_polygon, get_polygon_edges, local_perimeter, compute_
 from multiomicscellsim.taichi_cpm.config.constraints import constraint_factory
 from multiomicscellsim.taichi_cpm.config.cell_types import celltype_factory
 from multiomicscellsim.taichi_cpm.config.static import MAX_ENERGY_TERMS
-from multiomicscellsim.taichi_cpm.config.behaviours import behaviour_factory
+from multiomicscellsim.taichi_cpm.config.behaviours import AdhesionBehaviourConfig, behaviour_factory
 
 @ti.data_oriented
 class Simulation():
@@ -147,6 +147,9 @@ class Simulation():
         self.cells[cell_id].cell_id = cell_id
         # Set Cell parameters according to the cell type
         self.cell_types[cell_type].sample_cell(self.cells[cell_id], self)
+        for behav_id in range(self.n_behaviours):
+            if self.behaviour_to_celltype[behav_id] == cell_type:
+                self.behaviours[behav_id].on_new_cell(cell_id)
         # Draw a circular cell
         radius = 0.02
         n_edges = 16
@@ -507,8 +510,9 @@ from multiomicscellsim.taichi_cpm.config.constraints import PerimeterConstraintC
                                AnisotropyOrientationConstraintConfig
 
 from multiomicscellsim.taichi_cpm.config.cell_types import CellTypeConfig
-from multiomicscellsim.taichi_cpm.config.behaviours import EllipticPerimeterConfig, \
-                                MitosisAgeVolumeBehaviourConfig
+from multiomicscellsim.taichi_cpm.config.behaviours import EllipticPerimeterBehaviourConfig, \
+                              MitosisAgeVolumeBehaviourConfig, \
+                                AdhesionBehaviourConfig
 
 
 
@@ -537,30 +541,31 @@ sim_config = {
     "cell_types": [
         CellTypeConfig( 
             name="Type 1",
-            j_adhesion_stroma=0.0,
-            j_adhesion_other=4.0,
             preferred_volume_stats=[0.005, 0.0001],
             preferred_anisotropy_stats=[0.8, 0.001],
             preferred_orientation_stats=[[1.0, 0.1], [0.0, 0.1]],
             mitosis_age_stats=[10*10, 50],
             behaviours=[
-                            EllipticPerimeterConfig(dynamics=None),
+                            AdhesionBehaviourConfig(j_adhesion_stroma=0.0, 
+                                                    j_adhesion_other=4.0),
+                            EllipticPerimeterBehaviourConfig(dynamics=None),
                             MitosisAgeVolumeBehaviourConfig(dynamics=None, 
                                                             sigmoid_slope=0.01, 
                                                             probability_scale=0.1
-                                                            )
+                                                            ),
+                            
                        ]
         ),
         CellTypeConfig(
             name="Type 2",
-            j_adhesion_stroma=0.0,
-            j_adhesion_other=4.0,
             preferred_volume_stats=[0.001, 0.0001],
             preferred_anisotropy_stats=[0.8, 0.001],
             preferred_orientation_stats=[[1.0, 0.1], [0.0, 0.1]],
             mitosis_age_stats=[60*10, 50],
-            behaviours=[
-                            EllipticPerimeterConfig(dynamics=None),
+            behaviours=[    
+                            AdhesionBehaviourConfig(j_adhesion_stroma=0.0, 
+                                                    j_adhesion_other=4.0),
+                            EllipticPerimeterBehaviourConfig(dynamics=None),
                             MitosisAgeVolumeBehaviourConfig(dynamics=None, 
                                                             sigmoid_slope=0.01, 
                                                             probability_scale=0.1,
@@ -569,14 +574,14 @@ sim_config = {
         ),
         CellTypeConfig(
             name="Type 3",
-            j_adhesion_stroma=0.0,
-            j_adhesion_other=4.0,
             preferred_volume_stats=[0.01, 0.0001],
             preferred_anisotropy_stats=[0.2, 0.001],
             preferred_orientation_stats=[[1.0, 0.1], [0.0, 0.1]],
             mitosis_age_stats=[60*10, 50],
-            behaviours=[
-                            EllipticPerimeterConfig(dynamics=None),
+            behaviours=[    
+                            AdhesionBehaviourConfig(j_adhesion_stroma=0.0, 
+                                                    j_adhesion_other=4.0),
+                            EllipticPerimeterBehaviourConfig(dynamics=None),
                             MitosisAgeVolumeBehaviourConfig(dynamics=None, 
                                                             sigmoid_slope=0.01, 
                                                             probability_scale=0.1,

@@ -11,8 +11,6 @@ class CellTypeConfig(BaseModel):
     """
     name: str = Field(description="Name of the cell type")
     #behaviours: List[BaseBehaviourConfig] = Field(description="List of BehavioursConfig to govern preferred cell parameters")
-    j_adhesion_stroma: float = Field(description="Penalty coefficient for adhesion energy towards the stroma")
-    j_adhesion_other: float = Field(description="Penalty coefficient for adhesion towards other cells")
     preferred_volume_stats: List[float] = Field(description="Mean and std for preferred volume")
     preferred_anisotropy_stats: List[float] = Field(description="Mean and std for preferred anisotropy")
     preferred_orientation_stats: List[List[float]] = Field(description="Mean and std for preferred orientation")
@@ -28,8 +26,6 @@ def celltype_factory(id: int, ct: CellType, config: CellTypeConfig) -> None:
             config (CellTypeConfig): The configuration for the CellType.
     """
     ct.id = id
-    ct.j_adhesion_stroma = config.j_adhesion_stroma
-    ct.j_adhesion_other = config.j_adhesion_other
     ct.preferred_volume_stats = ti.Vector(arr=config.preferred_volume_stats)
     ct.preferred_anisotropy_stats = ti.Vector(arr=config.preferred_anisotropy_stats)
     ct.preferred_orientation_stats = ti.Vector(arr=config.preferred_orientation_stats)

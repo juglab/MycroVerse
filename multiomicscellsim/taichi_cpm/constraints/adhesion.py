@@ -20,9 +20,9 @@ class AdhesionConstraint(Constraint):
                 if not self.sim.is_out_of_bounds(i+i_offset, j+j_offset) and \
                    cell_id != self.sim.grid[i+i_offset, j+j_offset].cell_id:
                    if self.sim.grid[i+i_offset, j+j_offset].cell_id == 0:
-                       ti.atomic_add(energy, self.sim.cell_types[self.sim.cells[cell_id].cell_type].j_adhesion_stroma)
+                       ti.atomic_add(energy, self.sim.cells[cell_id].j_adhesion_stroma)
                    else:
-                       ti.atomic_add(energy, self.sim.cell_types[self.sim.cells[cell_id].cell_type].j_adhesion_other)
+                       ti.atomic_add(energy, self.sim.cells[cell_id].j_adhesion_other)
         return energy
     
     @ti.func
