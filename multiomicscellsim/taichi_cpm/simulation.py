@@ -37,9 +37,6 @@ class Simulation():
 
         self.n_constraints = len(self.constraints)
 
-        
-        
-
         # Chemicals parameters
         self.chemokine_seed = sim_config.get("chemokine_seed", 0)
         self.chemokine_scale = sim_config.get("chemokine_noise_scale", 6.0)
@@ -51,7 +48,6 @@ class Simulation():
 
         self.gui = ti.GUI(name="MycroVerse", res=self.size)
         self.render_grid = ti.field(dtype=float, shape=(self.size, self.size, 3))
-        
         
         # Field mapping behaviours (index in self.behaviours) to cell types id.
         # Initialized in setup_celltypes_and_behaviours
@@ -95,7 +91,7 @@ class Simulation():
     def reinit(self):
         self.grid = CellPoint.field(shape=(self.size, self.size))
         self.chemokine_grid = ti.field(dtype=float, shape=(self.size, self.size))
-        self.cells = Cell.field(shape=(self.max_cells,))
+        self.cells = Cell.field(shape=(self.max_cells+1,))
         self.n_cells = ti.field(dtype=int, shape=())
         self.n_cells[None] = 1 # First cell is the background
         self.chemokine_setup()
@@ -300,17 +296,11 @@ class Simulation():
                     self.cells[cell_id].should_split = 0
                     ti.atomic_add(self.n_cells[None], 1)
                     
-                    # TODO: Here we could implement mutations and stochasticity
-                    self.cells[new_cell_id].cell_type = self.cells[cell_id].cell_type
-                    self.cells[new_cell_id].preferred_volume = self.cells[cell_id].preferred_volume            
-                    self.cells[new_cell_id].preferred_perimeter = self.cells[cell_id].preferred_perimeter
-                    self.cells[new_cell_id].preferred_major_axis = self.cells[cell_id].preferred_major_axis
-                    self.cells[new_cell_id].preferred_anisotropy = self.cells[cell_id].preferred_anisotropy
-                    self.cells[new_cell_id].mitosis_age_threshold = self.cells[cell_id].mitosis_age_threshold
-                    self.cells[new_cell_id].should_split = 0
-                    self.cells[new_cell_id].current_age = 0.0
-                    # FIXME: Is this correct?
-                    self.cells[cell_id].current_age = 0.0
+                    # Initialize new cell parameters by calling the cell behaviours
+                    self.cells[new_cell_id].cell_id = new_cell_id
+                    for behav_id in ti.static(range(self.n_behaviours)):
+                        if self.behaviour_to_celltype[behav_id] == self.cells[cell_id].cell_type:
+                            self.behaviours[behav_id].on_mitosis(mother_id=cell_id, daughter_id=new_cell_id)
 
    
     @ti.kernel
@@ -379,11 +369,11 @@ class Simulation():
     def cpm_step(self):
         # Sources and targets are stored into .selected* and .copy_*
         self.select_potential_copies()
-        # Avoiding race conditions (where multiple pixels wants to source/target the same pixels)
+        # Calculate energy deltas for the selected pixels (stored in .copy_energy_delta)
         self.calc_energy()
+        # Perform the copy based on the Metropolis criterion
         self.do_copy()
-
-        # Update cell grid parameters from grid:
+        # Update cell parameters from grid state and behaviours
         self.update_grid_params()
     
     @ti.kernel
@@ -595,8 +585,6 @@ sim_config = {
         ),
     ]
 }
-
-
 
 sim = Simulation(sim_config)
 sim.run()
